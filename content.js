@@ -5,6 +5,13 @@
 
 (() => {
   const DOMAIN = location.hostname.replace(/^www\./, "");
+  // Flip this to true (or run `localStorage.setItem('pl-debug','1')` in the
+  // console on the page you're testing) to get step-by-step console logs
+  // of what detection found and rejected.
+  const DEBUG = (() => {
+    try { return localStorage.getItem("pl-debug") === "1"; } catch { return false; }
+  })();
+  const log = (...args) => DEBUG && console.log("[PriceLedger]", ...args);
 
   // ---------- 1. Extract product + price ----------
 
@@ -160,7 +167,10 @@
   // has inspected the real markup and found something more reliable than
   // the generic heuristic below. Add entries as {domain: selector}.
   const SITE_PRICE_SELECTORS = {
-    // "www.woolworths.com.au": "[data-testid='product-price'] .actual-price",
+    // Woolworths' price class has a CSS-module hash suffix that changes on
+    // redeploy (e.g. "...price-lead__vlm8f") — matching the stable prefix
+    // instead of the full class survives those rebuilds.
+    "www.woolworths.com.au": '[class*="product-price_component_price-lead"]',
   };
 
   function findPriceElements() {
@@ -190,45 +200,46 @@
     })[0];
   }
 
-  function waitForDomPrice(maxWaitMs = 6000) {
-    return new Promise((resolve) => {
-      const override = SITE_PRICE_SELECTORS[DOMAIN] || SITE_PRICE_SELECTORS[`www.${DOMAIN}`];
-      const tryFind = () => {
-        const el = override ? document.querySelector(override) : pickBestPriceElement(findPriceElements());
-        if (el) {
-          resolve(el);
-          return true;
-        }
-        return false;
-      };
-      if (tryFind()) return;
-      const observer = new MutationObserver(() => {
-        if (tryFind()) {
-          observer.disconnect();
-          clearTimeout(timeoutId);
-        }
-      });
-      observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-      const timeoutId = setTimeout(() => {
-        observer.disconnect();
-        resolve(null);
-      }, maxWaitMs);
-    });
-  }
-
-  async function detectFromDom() {
+  // Persistent DOM watcher — replaces the old fixed-timeout approach.
+  // Grocery sites like Woolworths/Coles often render no price at all (or a
+  // placeholder) until the shopper picks a delivery/pickup location, which
+  // is a user-paced action that can take far longer than any fixed
+  // timeout. Instead of giving up, this keeps watching for the page's
+  // lifetime (capped at 3 minutes to avoid burning CPU on abandoned tabs)
+  // and fires every time a valid, changed price shows up — including
+  // re-firing if the price updates after the shopper sets their location.
+  function startDomPriceWatcher() {
     const ogType = document.querySelector('meta[property="og:type"]')?.content?.toLowerCase() || "";
-    if (!ogType.startsWith("product")) return null;
+    log("og:type =", ogType || "(none)");
+    if (!ogType.startsWith("product")) {
+      log("skipping DOM watch: page doesn't declare og:type=product");
+      return;
+    }
 
-    const el = await waitForDomPrice();
-    if (!el) return null;
+    const override = SITE_PRICE_SELECTORS[DOMAIN] || SITE_PRICE_SELECTORS[`www.${DOMAIN}`];
+    log("DOM watcher active. override selector:", override || "(none, using heuristic)");
 
-    const match = el.textContent.match(/(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/);
-    if (!match) return null;
-    const num = parseFloat(match[0].replace(/[^0-9.]/g, ""));
-    if (Number.isNaN(num) || num <= 0) return null;
+    let lastPrice = null;
 
-    return buildMetaProduct(num, inferCurrencyFromDomain());
+    const check = async () => {
+      const el = override ? document.querySelector(override) : pickBestPriceElement(findPriceElements());
+      if (!el) return;
+      const match = el.textContent.match(/(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/);
+      if (!match) return;
+      const num = parseFloat(match[0].replace(/[^0-9.]/g, ""));
+      if (Number.isNaN(num) || num <= 0) return;
+      if (num === lastPrice) return; // already recorded this exact value
+      lastPrice = num;
+      log("DOM watcher found price:", num, `(from "${el.textContent.trim()}")`);
+      const product = buildMetaProduct(num, inferCurrencyFromDomain());
+      const history = await recordObservation(product);
+      renderBadge(product, history);
+    };
+
+    check();
+    const observer = new MutationObserver(check);
+    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    setTimeout(() => observer.disconnect(), 3 * 60 * 1000);
   }
 
   function buildMetaProduct(price, currency) {
@@ -370,13 +381,19 @@
   // ---------- 4. Run ----------
 
   async function run() {
-    let product = detectFromJsonLd() || detectFromMeta();
+    let product = detectFromJsonLd();
+    log("detectFromJsonLd:", product);
     if (!product) {
-      product = await detectFromDom();
+      product = detectFromMeta();
+      log("detectFromMeta:", product);
     }
-    if (!product) return;
-    const history = await recordObservation(product);
-    renderBadge(product, history);
+    if (product) {
+      const history = await recordObservation(product);
+      renderBadge(product, history);
+      return;
+    }
+    log("no structured price yet — handing off to persistent DOM watcher");
+    startDomPriceWatcher();
   }
 
   // Give client-rendered pages (React/Vue product pages) a beat to hydrate.
