@@ -1,0 +1,108 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  width: 320px;
+  max-height: 480px;
+  overflow-y: auto;
+  background: #101814;
+  color: #EDEAE0;
+  font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+}
+
+.pl-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 14px 12px;
+  border-bottom: 1px solid #2a362f;
+}
+
+.pl-mark {
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: linear-gradient(135deg, #E8A33D, #3FA796);
+  flex: none;
+}
+
+.pl-header h1 {
+  font-size: 13px;
+  margin: 0;
+  letter-spacing: 0.02em;
+}
+
+.pl-sub {
+  margin: 2px 0 0;
+  font-size: 9.5px;
+  color: #6B756E;
+  line-height: 1.3;
+}
+
+.pl-list {
+  padding: 6px 10px;
+}
+
+.pl-empty {
+  font-size: 11px;
+  color: #6B756E;
+  padding: 20px 4px;
+  text-align: center;
+  line-height: 1.5;
+}
+
+.pl-item {
+  padding: 9px 4px;
+  border-bottom: 1px solid #1c2620;
+}
+.pl-item:last-child { border-bottom: none; }
+
+.pl-item-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+
+.pl-item-title {
+  font-size: 10.5px;
+  color: #A8AFA6;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.pl-item-domain {
+  font-size: 8.5px;
+  color: #6B756E;
+  flex: none;
+}
+
+.pl-item-mid {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.pl-item-price {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.pl-item-verdict {
+  font-size: 9.5px;
+  color: #E8A33D;
+}
+.pl-item-verdict.pl-good {
+  color: #3FA796;
+}
+
+.pl-footer {
+  padding: 8px 14px;
+  font-size: 8.5px;
+  color: #4b544e;
+  border-top: 1px solid #2a362f;
+  text-align: center;
+}
