@@ -4,7 +4,7 @@
   bottom: 18px;
   right: 18px;
   z-index: 2147483647;
-  width: 220px;
+  width: 236px;
   background: #101814;
   border: 1px solid #2a362f;
   border-radius: 10px;
@@ -13,6 +13,10 @@
   font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
   color: #EDEAE0;
   animation: pl-rise 220ms ease-out;
+}
+
+#price-ledger-badge.pl-alert {
+  border-color: #6b3630;
 }
 
 @keyframes pl-rise {
@@ -101,4 +105,26 @@
   font-size: 9.5px;
   color: #6B756E;
   line-height: 1.4;
+}
+
+#price-ledger-badge .pl-claim {
+  font-size: 9.5px;
+  line-height: 1.4;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed #2a362f;
+  white-space: normal;
+}
+
+#price-ledger-badge .pl-claim-good {
+  color: #3FA796;
+}
+
+#price-ledger-badge .pl-claim-neutral {
+  color: #6B756E;
+}
+
+#price-ledger-badge .pl-claim-bad {
+  color: #E2574C;
+  font-weight: 600;
 }

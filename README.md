@@ -19,8 +19,15 @@ machine in this MVP.
 4. **The badge** — a small fixed card in the bottom-right shows the current
    price, a sparkline, and a verdict: *"lowest you've seen"* vs *"$X above
    your low."*
-5. **Popup** (`popup.html`) — lists everything tracked across every site,
-   most recent first, click through to revisit.
+5. **The claim check** — when a page shows a struck-through "was $X", RRP,
+   or "compare at" price, the badge checks that claim against what THIS
+   browser has actually observed for the item. If you've genuinely seen it
+   that high before, the claim checks out. If you've never seen it above a
+   much lower price, it's flagged as likely inflated. First-time visits are
+   marked "can't verify yet" rather than guessed at either way.
+6. **Popup** (`popup.html`) — lists everything tracked across every site,
+   most recent first, click through to revisit, with a flag on any item
+   whose most recent "was" claim looks inflated.
 
 ## Try it
 
@@ -47,8 +54,9 @@ machine in this MVP.
   product on two different retailers is tracked as two separate entries by
   design (the "fake sale" detection is per-retailer, which is usually what
   you want, but a "cheapest anywhere" feature would need explicit matching).
-- **No fake-discount label parsing** — it doesn't yet compare against the
-  site's own claimed "was $X" text, only against what *you've* actually
-  observed. That's a deliberately conservative starting point — comparing
-  your own memory against the seller's claim is the whole game once you
-  want to add it.
+- **No fake-discount label parsing** — resolved: see the claim check above.
+  Note its honesty limits though — it only flags a claim as suspicious once
+  you have at least one prior visit to compare against. A brand new item
+  with no history yet is reported as "can't verify," never as "fake,"
+  since there's no way to tell the difference between a genuine discount
+  and a normal price from data this thin.

@@ -99,6 +99,13 @@ body {
   color: #3FA796;
 }
 
+.pl-item-flag {
+  margin-top: 4px;
+  font-size: 9px;
+  color: #E2574C;
+  font-weight: 600;
+}
+
 .pl-footer {
   padding: 8px 14px;
   font-size: 8.5px;

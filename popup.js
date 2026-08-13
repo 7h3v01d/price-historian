@@ -36,6 +36,7 @@ async function main() {
     const prices = history.map((h) => h.p);
     const low = Math.min(...prices);
     const isLow = last.p <= low + 0.001;
+    const claimFlag = evaluateClaimFlag(history);
 
     const row = document.createElement("div");
     row.className = "pl-item";
@@ -50,11 +51,24 @@ async function main() {
           isLow ? "at its low" : `low was ${fmt(low, last.c)}`
         }</span>
       </div>
+      ${claimFlag ? `<div class="pl-item-flag">⚠ "was" price never seen — likely inflated</div>` : ""}
     `;
     row.addEventListener("click", () => chrome.tabs.create({ url: meta.url }));
     row.style.cursor = "pointer";
     list.appendChild(row);
   }
+}
+
+// Mirrors the badge's claim logic: flags when the most recent visit's
+// claimed was-price is well above anything actually observed before it.
+function evaluateClaimFlag(history) {
+  const last = history[history.length - 1];
+  if (!last || last.w == null) return false;
+  const past = history.slice(0, -1);
+  if (!past.length) return false;
+  const observedMax = Math.max(...past.map((h) => h.p));
+  const tolerance = last.w * 0.03;
+  return observedMax < last.w - tolerance;
 }
 
 function escapeHtml(str) {

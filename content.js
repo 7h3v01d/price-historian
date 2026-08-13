@@ -93,6 +93,9 @@
         productKey: id ? `id:${id}` : `name:${normalize(p.name || document.title)}`,
         price: priceInfo.price,
         currency: priceInfo.currency,
+        // JSON-LD's Offer schema has no standard "was/RRP" field — that
+        // claim only ever shows up as page text, so scan for it directly.
+        claimedWasPrice: findClaimedWasPrice(),
       };
     }
     return null;
@@ -200,46 +203,124 @@
     })[0];
   }
 
-  // Persistent DOM watcher — replaces the old fixed-timeout approach.
-  // Grocery sites like Woolworths/Coles often render no price at all (or a
-  // placeholder) until the shopper picks a delivery/pickup location, which
-  // is a user-paced action that can take far longer than any fixed
-  // timeout. Instead of giving up, this keeps watching for the page's
-  // lifetime (capped at 3 minutes to avoid burning CPU on abandoned tabs)
-  // and fires every time a valid, changed price shows up — including
-  // re-firing if the price updates after the shopper sets their location.
-  function startDomPriceWatcher() {
-    const ogType = document.querySelector('meta[property="og:type"]')?.content?.toLowerCase() || "";
-    log("og:type =", ogType || "(none)");
-    if (!ogType.startsWith("product")) {
-      log("skipping DOM watch: page doesn't declare og:type=product");
-      return;
+  // ---------- 1c. Claimed "was"/RRP price ----------
+  // Captures the figure the retailer wants you to compare against — a
+  // struck-through "was $X", an RRP, or a "compare at" price — so it can be
+  // checked against what THIS browser has actually observed, rather than
+  // trusted at face value.
+  function findClaimedWasPrice() {
+    const priceRegex = /(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/;
+
+    // Prefer genuine <del>/<s>/<strike> markup first — that's an explicit,
+    // unambiguous semantic signal a page can't casually get wrong.
+    const strikeEls = document.querySelectorAll("del, s, strike");
+    for (const el of strikeEls) {
+      const text = el.textContent.trim();
+      const match = text.match(priceRegex);
+      if (match && text.length < 24) {
+        return parseFloat(match[0].replace(/[^0-9.]/g, ""));
+      }
     }
+
+    // Fall back to the same class/id keyword heuristic used to exclude
+    // these from the current-price detector — same signal, opposite intent.
+    const nodes = document.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
+    for (const el of nodes) {
+      const flag = `${el.className} ${el.id}`.toLowerCase();
+      if (!/was|rrp|strike|compare-?at/.test(flag)) continue;
+      const text = el.textContent.trim();
+      const match = text.match(priceRegex);
+      if (match && text.length < 24) {
+        return parseFloat(match[0].replace(/[^0-9.]/g, ""));
+      }
+    }
+    return null;
+  }
+
+  // Persistent DOM watcher. Grocery sites like Woolworths/Coles often:
+  //  (a) render no price at all until a delivery/pickup location is set,
+  //      which is user-paced and can't be waited out with a fixed timeout, and
+  //  (b) swap between "product pages" as an in-place content change rather
+  //      than a real navigation — no URL change, so nothing tied to
+  //      navigation events (pushState/popstate/URL polling) ever fires.
+  // Content scripts also can't reliably intercept pushState anyway: they
+  // run in an isolated JS world, so patching history.pushState from here
+  // patches a *different* history object than the one the page's own
+  // router actually calls.
+  //
+  // Confirmed in testing: Coles' in-place swap is reliably caught by a
+  // MutationObserver on document.body. Woolworths/IGA are not — most likely
+  // because their router replaces a larger subtree in a way that leaves the
+  // observer watching content that's no longer where the action is. Rather
+  // than chase that framework-specific behaviour, this runs a guaranteed
+  // poll (checks every 1.2s regardless of whether any mutation fired) as
+  // the reliable primary mechanism, with the MutationObserver kept as a
+  // cheap "usually faster" fast path on top of it.
+  let activeWatcherObserver = null;
+  let activeWatcherInterval = null;
+
+  function stopDomPriceWatcher() {
+    if (activeWatcherObserver) {
+      activeWatcherObserver.disconnect();
+      activeWatcherObserver = null;
+    }
+    if (activeWatcherInterval) {
+      clearInterval(activeWatcherInterval);
+      activeWatcherInterval = null;
+      log("stopped existing DOM watcher");
+    }
+  }
+
+  function currentTitleGuess() {
+    return (document.querySelector('meta[property="og:title"]')?.content || document.title || "").trim();
+  }
+
+  function startDomPriceWatcher() {
+    stopDomPriceWatcher();
 
     const override = SITE_PRICE_SELECTORS[DOMAIN] || SITE_PRICE_SELECTORS[`www.${DOMAIN}`];
     log("DOM watcher active. override selector:", override || "(none, using heuristic)");
 
-    let lastPrice = null;
+    let lastKey = null;
 
     const check = async () => {
+      const ogType = document.querySelector('meta[property="og:type"]')?.content?.toLowerCase() || "";
+      if (!ogType.startsWith("product")) return;
+
       const el = override ? document.querySelector(override) : pickBestPriceElement(findPriceElements());
       if (!el) return;
       const match = el.textContent.match(/(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/);
       if (!match) return;
       const num = parseFloat(match[0].replace(/[^0-9.]/g, ""));
       if (Number.isNaN(num) || num <= 0) return;
-      if (num === lastPrice) return; // already recorded this exact value
-      lastPrice = num;
-      log("DOM watcher found price:", num, `(from "${el.textContent.trim()}")`);
+
+      const title = currentTitleGuess();
+      const key = `${location.pathname}::${title}::${num}`;
+      if (key === lastKey) return; // no meaningful change since last observation
+      lastKey = key;
+
+      log("DOM watcher: product/price changed ->", title, num);
       const product = buildMetaProduct(num, inferCurrencyFromDomain());
       const history = await recordObservation(product);
       renderBadge(product, history);
     };
 
     check();
+
+    // Fast path: fires quickly when the framework's mutations are of a
+    // kind this observer actually sees (works well on Coles).
     const observer = new MutationObserver(check);
     observer.observe(document.body, { childList: true, subtree: true, characterData: true });
-    setTimeout(() => observer.disconnect(), 3 * 60 * 1000);
+    activeWatcherObserver = observer;
+
+    // Reliable path: catches everything else within ~1.2s regardless of
+    // whether the observer above ever fires (needed for Woolworths/IGA).
+    activeWatcherInterval = setInterval(check, 1200);
+
+    // Generous cap, not a real limit in practice — this costs essentially
+    // nothing while idle. Just avoids leaving timers alive forever on a
+    // tab left open overnight.
+    setTimeout(stopDomPriceWatcher, 45 * 60 * 1000);
   }
 
   function buildMetaProduct(price, currency) {
@@ -254,6 +335,7 @@
       productKey: `name:${normalize(title)}`,
       price,
       currency,
+      claimedWasPrice: findClaimedWasPrice(),
     };
   }
 
@@ -282,7 +364,15 @@
     // Avoid spamming duplicate points on the same day at the same price.
     const sameDay = last && new Date(last.t).toDateString() === new Date(now).toDateString();
     if (!last || last.p !== product.price || !sameDay) {
-      history.push({ p: product.price, c: product.currency, t: now });
+      history.push({
+        p: product.price,
+        c: product.currency,
+        t: now,
+        // "w" = the retailer's own claimed was/RRP price at the time, if any.
+        // Kept per-datapoint so a claim can be checked against your actual
+        // observed history, not just today's number.
+        w: product.claimedWasPrice ?? null,
+      });
     }
     // Cap history length so storage doesn't grow unbounded.
     const trimmed = history.slice(-200);
@@ -327,6 +417,37 @@
     </svg>`;
   }
 
+  // Checks a retailer's claimed "was $X" against what THIS browser has
+  // actually seen for the item — the whole point of the extension.
+  // `history` includes today's just-recorded point, so we look at
+  // everything before it to judge whether the claim is independently
+  // corroborated by prior visits, not by today's own claim.
+  function evaluateClaim(product, history) {
+    if (product.claimedWasPrice == null) return null;
+    const past = history.slice(0, -1);
+    const was = product.claimedWasPrice;
+
+    if (past.length < 1) {
+      return {
+        tone: "neutral",
+        text: `Claims "was ${fmt(was, product.currency)}" — first time tracking this, can't verify yet.`,
+      };
+    }
+
+    const observedMax = Math.max(...past.map((h) => h.p));
+    const tolerance = was * 0.03; // small wiggle room for rounding/cent differences
+    if (observedMax >= was - tolerance) {
+      return {
+        tone: "good",
+        text: `Checks out — you've seen it at ${fmt(observedMax, product.currency)} before.`,
+      };
+    }
+    return {
+      tone: "bad",
+      text: `Never seen it above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim looks inflated.`,
+    };
+  }
+
   function renderBadge(product, history) {
     document.getElementById("price-ledger-badge")?.remove();
 
@@ -335,10 +456,13 @@
     const high = Math.max(...prices, product.price);
     const isAtLow = product.price <= low + 0.001;
     const diffFromLow = product.price - low;
+    const claim = evaluateClaim(product, history);
 
     const badge = document.createElement("div");
     badge.id = "price-ledger-badge";
-    badge.className = "pl-badge" + (isAtLow ? " pl-good" : "");
+    let stateClass = isAtLow ? " pl-good" : "";
+    if (claim?.tone === "bad") stateClass = " pl-alert";
+    badge.className = "pl-badge" + stateClass;
 
     const verdict = isAtLow
       ? history.length > 1
@@ -362,6 +486,7 @@
           ? `<div class="pl-row pl-meta">Low ${fmt(low, product.currency)} · High ${fmt(high, product.currency)} · ${history.length} checks</div>`
           : `<div class="pl-row pl-meta">Come back later — history builds as you browse.</div>`
       }
+      ${claim ? `<div class="pl-row pl-claim pl-claim-${claim.tone}">${escapeHtml(claim.text)}</div>` : ""}
     `;
 
     badge.querySelector(".pl-close").addEventListener("click", () => badge.remove());
@@ -381,6 +506,8 @@
   // ---------- 4. Run ----------
 
   async function run() {
+    document.getElementById("price-ledger-badge")?.remove();
+
     let product = detectFromJsonLd();
     log("detectFromJsonLd:", product);
     if (!product) {
@@ -388,6 +515,7 @@
       log("detectFromMeta:", product);
     }
     if (product) {
+      stopDomPriceWatcher();
       const history = await recordObservation(product);
       renderBadge(product, history);
       return;
@@ -395,6 +523,25 @@
     log("no structured price yet — handing off to persistent DOM watcher");
     startDomPriceWatcher();
   }
+
+  // ---------- 5. URL-change handling (supplementary, not primary) ----------
+  // Useful for sites that DO change the URL on navigation and DO ship fresh
+  // JSON-LD/meta per route (most "normal" retail sites) — re-runs detection
+  // so a real route change picks up the new page's structured data quickly.
+  // Note: patching history.pushState/replaceState from here does NOT work —
+  // content scripts run in an isolated JS world, so that patch would only
+  // ever see the isolated world's own copy of `history`, never the page's
+  // real router calling the real one. Polling location.href is the only
+  // part of this that's actually reliable from a content script.
+  // The DOM watcher above is what carries pages (like Woolworths/Coles)
+  // where content swaps in place without any URL change at all.
+  let lastHref = location.href;
+  setInterval(() => {
+    if (location.href === lastHref) return;
+    lastHref = location.href;
+    log("URL change detected ->", location.href);
+    setTimeout(run, 400);
+  }, 1000);
 
   // Give client-rendered pages (React/Vue product pages) a beat to hydrate.
   if (document.readyState === "complete") {
