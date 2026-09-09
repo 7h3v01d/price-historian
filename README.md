@@ -40,6 +40,23 @@ machine in this MVP.
    blocks remote scripts anyway), with hover tooltips per data point,
    record-low points marked in green, and suspicious "was"-claim points
    ringed in red so you can see exactly when a dubious "sale" happened.
+9. **Spend summary tab** (inside the history page) — this extension never
+   sees actual purchases, so "spend" here specifically means: the trended
+   value of everything you're tracking, priced at what you've actually
+   observed, not what you paid. Shows your current basket total, what it'd
+   cost if every item were at its own best price ever seen, the gap
+   between the two, and a weekly/monthly bar chart of that basket value
+   with new-low and flagged-claim counts per period.
+10. **Cross-retailer comparisons** — "+ Compare across retailers" in the
+    history sidebar lets you manually link 2+ tracked items you know are
+    the same physical product (say, the same milk at Woolworths, Coles,
+    and IGA). Linked items get their own entry showing who's cheapest
+    right now, an overlaid price-history chart per retailer, and each
+    retailer's own historical low. This is deliberately manual, not
+    automatic — matching product identity across sites reliably (same
+    item, different titles, no shared ID, different pack sizes) isn't
+    something worth guessing at; you know it's the same product, the tool
+    doesn't need to pretend to.
 
 ## Try it
 
@@ -86,3 +103,16 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
   a real red flag. The threshold is a judgment call, not a precise
   science — tune `MIN_DAYS_FOR_INFLATED_VERDICT` in `content.js`,
   `history.js`, and `popup.js` together if you want it stricter or looser.
+- **Spend summary assumes one currency across everything tracked.** It
+  sums raw price numbers without currency conversion — fine if everything
+  you track is in AUD (or whatever one currency), but would silently
+  produce a meaningless total if you ever tracked items priced in
+  genuinely different currencies. Worth fixing properly (group by
+  currency, show separate totals) if that ever becomes a real scenario.
+- **Comparisons are manual and don't auto-update membership.** Linking is
+  a one-time action — if a retailer stops selling an item or you start
+  tracking a better match, you'll need to delete the old comparison and
+  create a new one; there's no "edit members" flow yet, just create and
+  delete. Also, if a comparison somehow links two entries from the same
+  domain, they'll render in the same series color on the chart — a minor
+  cosmetic quirk, not a data problem.
