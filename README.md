@@ -28,10 +28,25 @@ machine in this MVP.
 6. **Popup** (`popup.html`) — lists everything tracked across every site,
    most recent first, click through to revisit, with a flag on any item
    whose most recent "was" claim looks inflated.
+7. **New-low alerts** — when a tracked item's price drops below anything
+   you've seen before (not just matches your low — genuinely beats it), a
+   background service worker fires an OS notification and puts a small
+   count on the toolbar icon until you open the popup. First-time items
+   never trigger this — there's nothing to have "beaten" yet.
+8. **Full history view** (`history.html`) — opens in its own tab from the
+   "Open full history & charts" button in the popup. A searchable sidebar
+   lists every tracked product; selecting one draws a real line chart of
+   its price over time (hand-rolled SVG, no external chart library — MV3
+   blocks remote scripts anyway), with hover tooltips per data point,
+   record-low points marked in green, and suspicious "was"-claim points
+   ringed in red so you can see exactly when a dubious "sale" happened.
 
 ## Try it
 
-1. Open `chrome://extensions`
+Works the same way in any Chromium-based browser, including **Opera** —
+same steps, just under `opera://extensions` instead of `chrome://extensions`.
+
+1. Open `chrome://extensions` (or `opera://extensions`)
 2. Enable **Developer mode** (top right)
 3. Click **Load unpacked**, select this `price-historian` folder
 4. Visit any product page with structured data (most Shopify stores, Best
@@ -40,6 +55,9 @@ machine in this MVP.
 5. Revisit the same product later (or edit `content.js` to fake a different
    price) to see the sparkline and "lowest seen" verdict kick in
 6. Click the toolbar icon to see everything tracked so far
+7. If your OS notification permissions block extension alerts, the browser
+   will usually prompt the first time one tries to fire — allow it, or the
+   toolbar badge count will still work as a silent fallback
 
 ## Known limitations (this is an MVP, not the pitch-deck version)
 
@@ -54,9 +72,17 @@ machine in this MVP.
   product on two different retailers is tracked as two separate entries by
   design (the "fake sale" detection is per-retailer, which is usually what
   you want, but a "cheapest anywhere" feature would need explicit matching).
-- **No fake-discount label parsing** — resolved: see the claim check above.
-  Note its honesty limits though — it only flags a claim as suspicious once
-  you have at least one prior visit to compare against. A brand new item
-  with no history yet is reported as "can't verify," never as "fake,"
-  since there's no way to tell the difference between a genuine discount
-  and a normal price from data this thin.
+- **Alerts are per-browser, not shared** — since history itself is
+  per-browser-profile (see above), new-low notifications only fire in
+  whichever browser actually recorded the drop. Two people tracking the
+  same product in separate browsers get two independent alert streams,
+  which is expected, not a bug — there's no shared state to notify from.
+- **Claim checks require ~14 days of tracking before flagging "inflated."**
+  A "was $X" claim you've never personally seen corroborated could mean
+  the claim is fake — or it could just mean you started tracking the item
+  after a genuine discount had already begun. Fewer than 14 days of
+  history reports "can't verify" either way rather than guessing; only a
+  longer window that still never reaches the claimed price is treated as
+  a real red flag. The threshold is a judgment call, not a precise
+  science — tune `MIN_DAYS_FOR_INFLATED_VERDICT` in `content.js`,
+  `history.js`, and `popup.js` together if you want it stricter or looser.

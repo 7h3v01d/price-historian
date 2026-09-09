@@ -59,8 +59,13 @@ async function main() {
   }
 }
 
-// Mirrors the badge's claim logic: flags when the most recent visit's
-// claimed was-price is well above anything actually observed before it.
+// Mirrors content.js's claim logic: only flags when the claim is both
+// uncorroborated AND we've tracked long enough for that to mean something.
+// A short tracking window reports nothing here — same reasoning as the
+// badge and history chart: an unseen high price might just mean we started
+// watching after a real discount already began, not that it's fake.
+const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
+
 function evaluateClaimFlag(history) {
   const last = history[history.length - 1];
   if (!last || last.w == null) return false;
@@ -68,7 +73,9 @@ function evaluateClaimFlag(history) {
   if (!past.length) return false;
   const observedMax = Math.max(...past.map((h) => h.p));
   const tolerance = last.w * 0.03;
-  return observedMax < last.w - tolerance;
+  if (observedMax >= last.w - tolerance) return false;
+  const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
+  return daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT;
 }
 
 function escapeHtml(str) {
@@ -78,3 +85,8 @@ function escapeHtml(str) {
 }
 
 main();
+chrome.runtime.sendMessage({ type: "PRICE_LEDGER_CLEAR_BADGE" });
+
+document.getElementById("open-history").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("history.html") });
+});

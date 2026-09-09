@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Price Ledger — History</title>
+  <link rel="stylesheet" href="history.css" />
+</head>
+<body>
+  <div class="pl-app">
+    <aside class="pl-sidebar">
+      <header class="pl-sidebar-header">
+        <div class="pl-mark"></div>
+        <div>
+          <h1>Price Ledger</h1>
+          <p class="pl-sub">Full history</p>
+        </div>
+      </header>
+      <input id="search" class="pl-search" type="text" placeholder="Search tracked products…" />
+      <div id="product-list" class="pl-product-list">
+        <p class="pl-empty">Loading…</p>
+      </div>
+    </aside>
+    <main class="pl-main" id="main">
+      <p class="pl-placeholder">Select a product on the left to see its full price history.</p>
+    </main>
+  </div>
+  <script src="history.js"></script>
+</body>
+</html>

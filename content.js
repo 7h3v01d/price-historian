@@ -301,8 +301,9 @@
 
       log("DOM watcher: product/price changed ->", title, num);
       const product = buildMetaProduct(num, inferCurrencyFromDomain());
-      const history = await recordObservation(product);
+      const { history, isNewLow, priorLow } = await recordObservation(product);
       renderBadge(product, history);
+      if (isNewLow) notifyNewLow(product, priorLow);
     };
 
     check();
@@ -359,6 +360,12 @@
     const mKey = metaKey(product.productKey);
     const history = await loadHistory(product.productKey);
 
+    // Snapshot the low BEFORE today's point is added, so "new low" means
+    // "lower than everything previously observed," not "lower than itself."
+    const priorPrices = history.map((h) => h.p);
+    const priorLow = priorPrices.length ? Math.min(...priorPrices) : null;
+    const isNewLow = priorLow !== null && product.price < priorLow - 0.001;
+
     const now = Date.now();
     const last = history[history.length - 1];
     // Avoid spamming duplicate points on the same day at the same price.
@@ -387,7 +394,33 @@
       },
     });
 
-    return trimmed;
+    return { history: trimmed, isNewLow, priorLow };
+  }
+
+  // Content scripts run per-page, so a single in-memory guard is enough to
+  // stop the poll/observer from firing duplicate notifications for the same
+  // price within one page visit — storage-level dedup (above) handles the
+  // rest across visits.
+  const notifiedThisPageLoad = new Set();
+
+  function notifyNewLow(product, priorLow) {
+    const dedupeKey = `${product.productKey}::${product.price}`;
+    if (notifiedThisPageLoad.has(dedupeKey)) return;
+    notifiedThisPageLoad.add(dedupeKey);
+
+    log("new low detected, notifying background:", product.price, "< prior low", priorLow);
+    try {
+      chrome.runtime.sendMessage({
+        type: "PRICE_LEDGER_NEW_LOW",
+        title: product.title,
+        price: product.price,
+        currency: product.currency,
+        priorLow,
+        url: location.href,
+      });
+    } catch (e) {
+      log("failed to send new-low notification:", e);
+    }
   }
 
   // ---------- 3. Badge UI ----------
@@ -422,6 +455,17 @@
   // `history` includes today's just-recorded point, so we look at
   // everything before it to judge whether the claim is independently
   // corroborated by prior visits, not by today's own claim.
+  //
+  // Important: "never seen it that high" only means something if we've
+  // been watching long enough to plausibly have caught it. If tracking
+  // started partway through an already-discounted period, our own history
+  // will never reach the pre-discount price — that's a gap in OUR data,
+  // not evidence the retailer's claim is false. So a short tracking window
+  // reports "can't verify" rather than "inflated," no matter how far off
+  // the claim looks; only a longer window that still never reaches the
+  // claimed price is treated as a real red flag.
+  const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
+
   function evaluateClaim(product, history) {
     if (product.claimedWasPrice == null) return null;
     const past = history.slice(0, -1);
@@ -442,9 +486,18 @@
         text: `Checks out — you've seen it at ${fmt(observedMax, product.currency)} before.`,
       };
     }
+
+    const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
+    if (daysTracked < MIN_DAYS_FOR_INFLATED_VERDICT) {
+      return {
+        tone: "neutral",
+        text: `Only tracked for ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, product.currency)}" claim.`,
+      };
+    }
+
     return {
       tone: "bad",
-      text: `Never seen it above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim looks inflated.`,
+      text: `Tracked for ${Math.round(daysTracked)} days, never above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim looks inflated.`,
     };
   }
 
@@ -516,8 +569,9 @@
     }
     if (product) {
       stopDomPriceWatcher();
-      const history = await recordObservation(product);
+      const { history, isNewLow, priorLow } = await recordObservation(product);
       renderBadge(product, history);
+      if (isNewLow) notifyNewLow(product, priorLow);
       return;
     }
     log("no structured price yet — handing off to persistent DOM watcher");
