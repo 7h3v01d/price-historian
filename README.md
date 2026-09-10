@@ -8,6 +8,11 @@ machine in this MVP.
 
 ## How it works
 
+`shared.js` holds a few small helpers (`fmt()`, `escapeHtml()`, and the
+claim-confidence constant) used by `content.js`, `popup.js`, and
+`history.js` — loaded before each of them so there's one definition
+instead of three copies quietly drifting apart.
+
 1. **Detection** (`content.js`) — on every page load, it looks for
    `schema.org/Product` JSON-LD first (what most modern storefronts embed
    for SEO), then falls back to Open Graph / `itemprop="price"` meta tags.
@@ -101,8 +106,9 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
   history reports "can't verify" either way rather than guessing; only a
   longer window that still never reaches the claimed price is treated as
   a real red flag. The threshold is a judgment call, not a precise
-  science — tune `MIN_DAYS_FOR_INFLATED_VERDICT` in `content.js`,
-  `history.js`, and `popup.js` together if you want it stricter or looser.
+  science — it's `MIN_DAYS_FOR_INFLATED_VERDICT` in `shared.js`, used by
+  `content.js`, `history.js`, and `popup.js` — tune it there if you want
+  it stricter or looser.
 - **Spend summary assumes one currency across everything tracked.** It
   sums raw price numbers without currency conversion — fine if everything
   you track is in AUD (or whatever one currency), but would silently

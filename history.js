@@ -1,11 +1,3 @@
-function fmt(price, currency) {
-  try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(price);
-  } catch {
-    return `${currency} ${price.toFixed(2)}`;
-  }
-}
-
 function formatShortDate(t) {
   return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
@@ -14,18 +6,12 @@ function formatFullDate(t) {
   return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
-}
-
 // Mirrors the logic in content.js: was this point's claimed "was" price
 // actually corroborated by anything observed before it? A short tracking
 // window before this point reports "neutral" rather than "bad" — not
 // having seen the higher price yet doesn't mean it's fake, it might just
 // mean tracking started partway through an already-discounted period.
-const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
+// (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
 
 function evaluateClaimAt(history, i) {
   const point = history[i];

@@ -5,13 +5,6 @@
 
 (() => {
   const DOMAIN = location.hostname.replace(/^www\./, "");
-  // Flip this to true (or run `localStorage.setItem('pl-debug','1')` in the
-  // console on the page you're testing) to get step-by-step console logs
-  // of what detection found and rejected.
-  const DEBUG = (() => {
-    try { return localStorage.getItem("pl-debug") === "1"; } catch { return false; }
-  })();
-  const log = (...args) => DEBUG && console.log("[PriceLedger]", ...args);
 
   // ---------- 1. Extract product + price ----------
 
@@ -267,7 +260,6 @@
     if (activeWatcherInterval) {
       clearInterval(activeWatcherInterval);
       activeWatcherInterval = null;
-      log("stopped existing DOM watcher");
     }
   }
 
@@ -279,7 +271,6 @@
     stopDomPriceWatcher();
 
     const override = SITE_PRICE_SELECTORS[DOMAIN] || SITE_PRICE_SELECTORS[`www.${DOMAIN}`];
-    log("DOM watcher active. override selector:", override || "(none, using heuristic)");
 
     let lastKey = null;
 
@@ -299,7 +290,6 @@
       if (key === lastKey) return; // no meaningful change since last observation
       lastKey = key;
 
-      log("DOM watcher: product/price changed ->", title, num);
       const product = buildMetaProduct(num, inferCurrencyFromDomain());
       const { history, isNewLow, priorLow } = await recordObservation(product);
       renderBadge(product, history);
@@ -408,7 +398,6 @@
     if (notifiedThisPageLoad.has(dedupeKey)) return;
     notifiedThisPageLoad.add(dedupeKey);
 
-    log("new low detected, notifying background:", product.price, "< prior low", priorLow);
     try {
       chrome.runtime.sendMessage({
         type: "PRICE_LEDGER_NEW_LOW",
@@ -419,19 +408,12 @@
         url: location.href,
       });
     } catch (e) {
-      log("failed to send new-low notification:", e);
+      console.error("[Price Ledger] failed to send new-low notification:", e);
     }
   }
 
   // ---------- 3. Badge UI ----------
-
-  function fmt(price, currency) {
-    try {
-      return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(price);
-    } catch {
-      return `${currency} ${price.toFixed(2)}`;
-    }
-  }
+  // (fmt() and escapeHtml() come from shared.js, loaded before this script.)
 
   function buildSparkline(history) {
     if (history.length < 2) return "";
@@ -464,7 +446,7 @@
   // reports "can't verify" rather than "inflated," no matter how far off
   // the claim looks; only a longer window that still never reaches the
   // claimed price is treated as a real red flag.
-  const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
+  // (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
 
   function evaluateClaim(product, history) {
     if (product.claimedWasPrice == null) return null;
@@ -550,22 +532,14 @@
     return str.length > n ? str.slice(0, n - 1) + "…" : str;
   }
 
-  function escapeHtml(str) {
-    const div = document.createElement("div");
-    div.textContent = str;
-    return div.innerHTML;
-  }
-
   // ---------- 4. Run ----------
 
   async function run() {
     document.getElementById("price-ledger-badge")?.remove();
 
     let product = detectFromJsonLd();
-    log("detectFromJsonLd:", product);
     if (!product) {
       product = detectFromMeta();
-      log("detectFromMeta:", product);
     }
     if (product) {
       stopDomPriceWatcher();
@@ -574,7 +548,6 @@
       if (isNewLow) notifyNewLow(product, priorLow);
       return;
     }
-    log("no structured price yet — handing off to persistent DOM watcher");
     startDomPriceWatcher();
   }
 
@@ -593,7 +566,6 @@
   setInterval(() => {
     if (location.href === lastHref) return;
     lastHref = location.href;
-    log("URL change detected ->", location.href);
     setTimeout(run, 400);
   }, 1000);
 

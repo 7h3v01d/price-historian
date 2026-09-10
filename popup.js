@@ -1,11 +1,3 @@
-function fmt(price, currency) {
-  try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(price);
-  } catch {
-    return `${currency} ${price.toFixed(2)}`;
-  }
-}
-
 async function main() {
   const all = await chrome.storage.local.get(null);
 
@@ -64,7 +56,7 @@ async function main() {
 // A short tracking window reports nothing here — same reasoning as the
 // badge and history chart: an unseen high price might just mean we started
 // watching after a real discount already began, not that it's fake.
-const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
+// (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
 
 function evaluateClaimFlag(history) {
   const last = history[history.length - 1];
@@ -76,12 +68,6 @@ function evaluateClaimFlag(history) {
   if (observedMax >= last.w - tolerance) return false;
   const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
   return daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT;
-}
-
-function escapeHtml(str) {
-  const div = document.createElement("div");
-  div.textContent = str;
-  return div.innerHTML;
 }
 
 main();
