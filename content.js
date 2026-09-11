@@ -64,34 +64,72 @@
     if (!offers) return null;
     const list = Array.isArray(offers) ? offers : [offers];
     for (const offer of list) {
+      // An exact `price` is a real, displayed price for this offer. A
+      // `lowPrice` (from an AggregateOffer, e.g. across sellers or
+      // variants) or a `priceSpecification.price` is a range floor or
+      // derived figure — plausible, but not the same confidence level as
+      // "this is literally the price shown." Tracked separately so
+      // candidate scoring below can prefer the former.
+      const hasExactPrice = offer.price !== undefined && offer.price !== null && offer.price !== "";
       const price = offer.price ?? offer.lowPrice ?? offer?.priceSpecification?.price;
       if (price !== undefined && price !== null && price !== "") {
-        const currency = offer.priceCurrency ?? offer?.priceSpecification?.priceCurrency ?? inferCurrencyFromDomain();
-        const num = parseFloat(String(price).replace(/[^0-9.]/g, ""));
-        if (!Number.isNaN(num) && num > 0) return { price: num, currency };
+        const rawCurrency = offer.priceCurrency ?? offer?.priceSpecification?.priceCurrency;
+        const currency = sanitizeCurrency(rawCurrency, inferCurrencyFromDomain());
+        const num = parsePriceAmount(String(price));
+        if (num != null) return { price: num, currency, isExact: hasExactPrice };
       }
     }
     return null;
   }
 
+  // A rough, deliberately simple similarity check — not fuzzy-matching
+  // for its own sake, just enough to tell "this Product's name is
+  // basically the page's title" from "this is some unrelated Product
+  // object that happened to be on the page" (e.g. a related-items widget).
+  function titleSimilarity(candidateName, pageTitle) {
+    if (!candidateName || !pageTitle) return 0;
+    const a = candidateName.toLowerCase().trim();
+    const b = pageTitle.toLowerCase().trim();
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    return a.includes(b) || b.includes(a) ? 0.5 : 0;
+  }
+
   function detectFromJsonLd() {
     const products = parseJsonLdProducts();
+    const pageTitle = document.querySelector('meta[property="og:title"]')?.content || document.title || "";
+
+    // A page can embed multiple Product objects (variants, related items,
+    // a whole listing's worth of JSON-LD). Taking "the first one with any
+    // usable offer" risked picking the wrong one entirely. Score every
+    // candidate instead and take the best: an exact displayed price
+    // outranks a range floor, and a name that actually matches the page
+    // outranks one that doesn't.
+    let best = null;
+    let bestScore = -Infinity;
     for (const p of products) {
       const priceInfo = extractOfferPrice(p.offers);
       if (!priceInfo) continue;
-      const id = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
-      return {
-        title: (p.name || document.title || "").trim().slice(0, 140),
-        image: firstImage(p.image),
-        productKey: id ? `id:${id}` : `name:${normalize(p.name || document.title)}`,
-        price: priceInfo.price,
-        currency: priceInfo.currency,
-        // JSON-LD's Offer schema has no standard "was/RRP" field — that
-        // claim only ever shows up as page text, so scan for it directly.
-        claimedWasPrice: findClaimedWasPrice(),
-      };
+      const score = (priceInfo.isExact ? 2 : 0) + titleSimilarity(p.name, pageTitle);
+      if (score > bestScore) {
+        bestScore = score;
+        best = { p, priceInfo };
+      }
     }
-    return null;
+    if (!best) return null;
+
+    const { p, priceInfo } = best;
+    const id = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
+    return {
+      title: (p.name || document.title || "").trim().slice(0, 140),
+      image: firstImage(p.image),
+      productKey: id ? `id:${id}` : `name:${normalize(p.name || document.title)}`,
+      price: priceInfo.price,
+      currency: priceInfo.currency,
+      // JSON-LD's Offer schema has no standard "was/RRP" field — that
+      // claim only ever shows up as page text, so scan for it directly.
+      claimedWasPrice: findClaimedWasPrice(),
+    };
   }
 
   function firstImage(image) {
@@ -123,12 +161,12 @@
       document.querySelector('meta[property="og:price:amount"]');
 
     if (isDeclaredProductPage && ogPriceEl) {
-      const num = parseFloat(String(ogPriceEl.content).replace(/[^0-9.]/g, ""));
-      if (!Number.isNaN(num) && num > 0) {
-        const currency =
+      const num = parsePriceAmount(String(ogPriceEl.content));
+      if (num != null) {
+        const rawCurrency =
           document.querySelector('meta[property="product:price:currency"]')?.content ||
-          document.querySelector('meta[property="og:price:currency"]')?.content ||
-          inferCurrencyFromDomain();
+          document.querySelector('meta[property="og:price:currency"]')?.content;
+        const currency = sanitizeCurrency(rawCurrency, inferCurrencyFromDomain());
         return buildMetaProduct(num, currency);
       }
     }
@@ -141,8 +179,8 @@
       const itemPropEls = document.querySelectorAll('[itemprop="price"]');
       if (itemPropEls.length === 1) {
         const raw = itemPropEls[0].getAttribute("content") || itemPropEls[0].textContent;
-        const num = parseFloat(String(raw).replace(/[^0-9.]/g, ""));
-        if (!Number.isNaN(num) && num > 0) {
+        const num = parsePriceAmount(String(raw));
+        if (num != null) {
           return buildMetaProduct(num, inferCurrencyFromDomain());
         }
       }
@@ -170,12 +208,12 @@
   };
 
   function findPriceElements() {
-    const priceRegex = /(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/;
+    const looksLikePrice = /(?:\$|£|€)\s?\d/;
     const nodes = document.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
     const candidates = [];
     for (const el of nodes) {
       const text = el.textContent.trim();
-      if (!priceRegex.test(text) || text.length > 24) continue;
+      if (!looksLikePrice.test(text) || text.length > 24) continue;
       const flag = `${el.className} ${el.id}`.toLowerCase();
       // Skip strikethrough "was" prices, RRPs, and per-unit ($/100g) prices —
       // we want the actual current total price, not a comparison figure.
@@ -202,17 +240,14 @@
   // checked against what THIS browser has actually observed, rather than
   // trusted at face value.
   function findClaimedWasPrice() {
-    const priceRegex = /(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/;
-
     // Prefer genuine <del>/<s>/<strike> markup first — that's an explicit,
     // unambiguous semantic signal a page can't casually get wrong.
     const strikeEls = document.querySelectorAll("del, s, strike");
     for (const el of strikeEls) {
       const text = el.textContent.trim();
-      const match = text.match(priceRegex);
-      if (match && text.length < 24) {
-        return parseFloat(match[0].replace(/[^0-9.]/g, ""));
-      }
+      if (text.length >= 24) continue;
+      const price = extractPriceFromText(text);
+      if (price != null) return price;
     }
 
     // Fall back to the same class/id keyword heuristic used to exclude
@@ -222,10 +257,9 @@
       const flag = `${el.className} ${el.id}`.toLowerCase();
       if (!/was|rrp|strike|compare-?at/.test(flag)) continue;
       const text = el.textContent.trim();
-      const match = text.match(priceRegex);
-      if (match && text.length < 24) {
-        return parseFloat(match[0].replace(/[^0-9.]/g, ""));
-      }
+      if (text.length >= 24) continue;
+      const price = extractPriceFromText(text);
+      if (price != null) return price;
     }
     return null;
   }
@@ -251,6 +285,7 @@
   // cheap "usually faster" fast path on top of it.
   let activeWatcherObserver = null;
   let activeWatcherInterval = null;
+  let activeWatcherTimeoutId = null;
 
   function stopDomPriceWatcher() {
     if (activeWatcherObserver) {
@@ -260,6 +295,10 @@
     if (activeWatcherInterval) {
       clearInterval(activeWatcherInterval);
       activeWatcherInterval = null;
+    }
+    if (activeWatcherTimeoutId) {
+      clearTimeout(activeWatcherTimeoutId);
+      activeWatcherTimeoutId = null;
     }
   }
 
@@ -280,10 +319,8 @@
 
       const el = override ? document.querySelector(override) : pickBestPriceElement(findPriceElements());
       if (!el) return;
-      const match = el.textContent.match(/(?:\$|£|€)\s?\d{1,4}(?:\.\d{2})?/);
-      if (!match) return;
-      const num = parseFloat(match[0].replace(/[^0-9.]/g, ""));
-      if (Number.isNaN(num) || num <= 0) return;
+      const num = extractPriceFromText(el.textContent);
+      if (num == null) return;
 
       const title = currentTitleGuess();
       const key = `${location.pathname}::${title}::${num}`;
@@ -310,8 +347,13 @@
 
     // Generous cap, not a real limit in practice — this costs essentially
     // nothing while idle. Just avoids leaving timers alive forever on a
-    // tab left open overnight.
-    setTimeout(stopDomPriceWatcher, 45 * 60 * 1000);
+    // tab left open overnight. Tracked and cleared in stopDomPriceWatcher()
+    // so a restart doesn't leave a stale timer that kills the new watcher
+    // early (that was a real bug: without tracking this, restarting the
+    // watcher — e.g. on a real page navigation — left the old 45-minute
+    // timer armed, which could then fire and stop the brand-new watcher
+    // well short of its own intended lifetime).
+    activeWatcherTimeoutId = setTimeout(stopDomPriceWatcher, 45 * 60 * 1000);
   }
 
   function buildMetaProduct(price, currency) {
@@ -345,22 +387,57 @@
     return result[key] || [];
   }
 
-  async function recordObservation(product) {
+  // recordObservation() is a read-modify-write against chrome.storage.local:
+  // load history, mutate it, write the whole thing back. This content
+  // script deliberately runs both a MutationObserver AND a 1.2s poll at
+  // the same time (see startDomPriceWatcher) as two paths to catch the
+  // same price change, which means it can genuinely call this function
+  // twice in close succession for what's logically one observation. A
+  // simple promise-chain lock serializes those calls so the second one
+  // always sees the first one's write, rather than both reading the same
+  // stale history and one silently overwriting the other's result.
+  //
+  // This does NOT protect against a second browser TAB observing the same
+  // product concurrently — that would need writes centralized in the
+  // background service worker (each content script/tab has its own
+  // separate JS context, so an in-page lock like this one can't reach
+  // across tabs). That's accepted as a known gap for now: worth fixing
+  // properly if it ever turns out to matter in practice, but a bigger
+  // architectural change than this pass covers.
+  let recordQueue = Promise.resolve();
+
+  function recordObservation(product) {
+    const result = recordQueue.then(() => recordObservationUnsafe(product));
+    // Swallow rejections in the chain itself so one failed write doesn't
+    // permanently wedge every future call behind a rejected promise —
+    // each caller still sees its own real result or error via `result`.
+    recordQueue = result.catch(() => {});
+    return result;
+  }
+
+  async function recordObservationUnsafe(product) {
     const key = historyKey(product.productKey);
     const mKey = metaKey(product.productKey);
     const history = await loadHistory(product.productKey);
 
     // Snapshot the low BEFORE today's point is added, so "new low" means
     // "lower than everything previously observed," not "lower than itself."
-    const priorPrices = history.map((h) => h.p);
+    // Only compare within the same currency — a $65 USD reading isn't a
+    // "new low" against a $100 AUD history, those numbers aren't
+    // commensurable. A currency change effectively starts a fresh
+    // comparison baseline rather than corrupting the existing one.
+    const priorSameCurrency = filterSameCurrency(history, product.currency);
+    const priorPrices = priorSameCurrency.map((h) => h.p);
     const priorLow = priorPrices.length ? Math.min(...priorPrices) : null;
     const isNewLow = priorLow !== null && product.price < priorLow - 0.001;
 
     const now = Date.now();
     const last = history[history.length - 1];
-    // Avoid spamming duplicate points on the same day at the same price.
+    // Avoid spamming duplicate points on the same day at the same price —
+    // but a currency change is a real change even if the number matches.
     const sameDay = last && new Date(last.t).toDateString() === new Date(now).toDateString();
-    if (!last || last.p !== product.price || !sameDay) {
+    const sameReading = last && last.p === product.price && last.c === product.currency;
+    if (!last || !sameReading || !sameDay) {
       history.push({
         p: product.price,
         c: product.currency,
@@ -439,18 +516,26 @@
   // corroborated by prior visits, not by today's own claim.
   //
   // Important: "never seen it that high" only means something if we've
-  // been watching long enough to plausibly have caught it. If tracking
-  // started partway through an already-discounted period, our own history
-  // will never reach the pre-discount price — that's a gap in OUR data,
-  // not evidence the retailer's claim is false. So a short tracking window
-  // reports "can't verify" rather than "inflated," no matter how far off
-  // the claim looks; only a longer window that still never reaches the
-  // claimed price is treated as a real red flag.
-  // (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
+  // been watching long enough — and often enough — to plausibly have
+  // caught it. Two visits two weeks apart technically span 14 days but
+  // don't actually establish much about what happened in between, so this
+  // requires both a minimum day-span AND a minimum number of distinct
+  // observations before treating an uncorroborated claim as a real red
+  // flag. If tracking started partway through an already-discounted
+  // period, our own history will never reach the pre-discount price —
+  // that's a gap in OUR data, not evidence the retailer's claim is false.
+  // The wording below is deliberately evidential ("not corroborated by
+  // your observed history") rather than accusatory ("fake") — thin
+  // observation data can rule a claim uncorroborated, but proving it's
+  // actually inflated would need more sampling than a browser extension
+  // casually browsing a site can gather.
+  // (MIN_DAYS_FOR_INFLATED_VERDICT / MIN_OBSERVATIONS_FOR_INFLATED_VERDICT
+  // come from shared.js.)
 
   function evaluateClaim(product, history) {
     if (product.claimedWasPrice == null) return null;
-    const past = history.slice(0, -1);
+    const sameCurrencyHistory = filterSameCurrency(history, product.currency);
+    const past = sameCurrencyHistory.slice(0, -1);
     const was = product.claimedWasPrice;
 
     if (past.length < 1) {
@@ -470,23 +555,29 @@
     }
 
     const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
-    if (daysTracked < MIN_DAYS_FOR_INFLATED_VERDICT) {
+    const hasEnoughSpan = daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT;
+    const hasEnoughObservations = past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
+    if (!hasEnoughSpan || !hasEnoughObservations) {
       return {
         tone: "neutral",
-        text: `Only tracked for ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, product.currency)}" claim.`,
+        text: `Only ${past.length} check(s) over ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, product.currency)}" claim.`,
       };
     }
 
     return {
       tone: "bad",
-      text: `Tracked for ${Math.round(daysTracked)} days, never above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim looks inflated.`,
+      text: `${past.length} checks over ${Math.round(daysTracked)} days, never above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim isn't corroborated by your observed history.`,
     };
   }
 
   function renderBadge(product, history) {
     document.getElementById("price-ledger-badge")?.remove();
 
-    const prices = history.map((h) => h.p);
+    // Same-currency filtering matters here too — a badge showing "low
+    // $65" against a $100 history that switched currency mid-stream would
+    // be comparing numbers that aren't actually commensurable.
+    const sameCurrencyHistory = filterSameCurrency(history, product.currency);
+    const prices = sameCurrencyHistory.map((h) => h.p);
     const low = Math.min(...prices, product.price);
     const high = Math.max(...prices, product.price);
     const isAtLow = product.price <= low + 0.001;
@@ -500,7 +591,7 @@
     badge.className = "pl-badge" + stateClass;
 
     const verdict = isAtLow
-      ? history.length > 1
+      ? sameCurrencyHistory.length > 1
         ? "Lowest you've seen"
         : "First time tracking this"
       : `${fmt(diffFromLow, product.currency)} above your low`;
@@ -513,12 +604,12 @@
       </div>
       <div class="pl-row pl-price-row">
         <span class="pl-price">${fmt(product.price, product.currency)}</span>
-        ${buildSparkline(history)}
+        ${buildSparkline(sameCurrencyHistory)}
       </div>
       <div class="pl-row pl-verdict">${verdict}</div>
       ${
-        history.length > 1
-          ? `<div class="pl-row pl-meta">Low ${fmt(low, product.currency)} · High ${fmt(high, product.currency)} · ${history.length} checks</div>`
+        sameCurrencyHistory.length > 1
+          ? `<div class="pl-row pl-meta">Low ${fmt(low, product.currency)} · High ${fmt(high, product.currency)} · ${sameCurrencyHistory.length} checks</div>`
           : `<div class="pl-row pl-meta">Come back later — history builds as you browse.</div>`
       }
       ${claim ? `<div class="pl-row pl-claim pl-claim-${claim.tone}">${escapeHtml(claim.text)}</div>` : ""}

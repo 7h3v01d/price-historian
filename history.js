@@ -8,21 +8,27 @@ function formatFullDate(t) {
 
 // Mirrors the logic in content.js: was this point's claimed "was" price
 // actually corroborated by anything observed before it? A short tracking
-// window before this point reports "neutral" rather than "bad" — not
-// having seen the higher price yet doesn't mean it's fake, it might just
-// mean tracking started partway through an already-discounted period.
-// (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
+// window (by days OR by number of distinct checks) before this point
+// reports "neutral" rather than "bad" — not having seen the higher price
+// yet doesn't mean it's fake, it might just mean tracking started partway
+// through an already-discounted period, or there simply isn't much data
+// yet either way.
+// (MIN_DAYS_FOR_INFLATED_VERDICT / MIN_OBSERVATIONS_FOR_INFLATED_VERDICT
+// come from shared.js.)
 
 function evaluateClaimAt(history, i) {
   const point = history[i];
   if (point.w == null) return null;
-  const past = history.slice(0, i);
+  // Only compare within the same currency as this point — mixing currency
+  // series would make "observed max" meaningless.
+  const past = history.slice(0, i).filter((h) => h.c === point.c);
   if (!past.length) return { tone: "neutral" };
   const observedMax = Math.max(...past.map((h) => h.p));
   const tolerance = point.w * 0.03;
   if (observedMax >= point.w - tolerance) return { tone: "good" };
   const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
-  return daysTracked < MIN_DAYS_FOR_INFLATED_VERDICT ? { tone: "neutral" } : { tone: "bad" };
+  const hasEnoughEvidence = daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT && past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
+  return hasEnoughEvidence ? { tone: "bad" } : { tone: "neutral" };
 }
 
 async function loadAllProducts() {
@@ -264,13 +270,19 @@ function renderChart(product) {
   const main = document.getElementById("main");
   const history = product.history;
   const last = history[history.length - 1];
-  const prices = history.map((h) => h.p);
+  // Display (chart + stat cards) is filtered to the current currency —
+  // mixing currencies on one axis would plot numbers as if they were
+  // comparable when they aren't. Claim evaluation below still uses the
+  // full, unfiltered history since evaluateClaimAt does its own
+  // currency-matching internally and needs the real array index.
+  const chartHistory = filterSameCurrency(history, last.c);
+  const prices = chartHistory.map((h) => h.p);
   const low = Math.min(...prices);
   const high = Math.max(...prices);
   const isAtLow = last.p <= low + 0.001;
   const claim = evaluateClaimAt(history, history.length - 1);
 
-  const { svg, points } = buildChartSvg(history);
+  const { svg, points } = buildChartSvg(chartHistory);
 
   main.innerHTML = `
     <div class="pl-header-row">
@@ -294,7 +306,7 @@ function renderChart(product) {
       </div>
       <div class="pl-stat">
         <span class="pl-stat-label">Checks</span>
-        <span class="pl-stat-value">${history.length}</span>
+        <span class="pl-stat-value">${chartHistory.length}</span>
       </div>
       <div class="pl-stat">
         <span class="pl-stat-label">Status</span>
@@ -315,7 +327,7 @@ function renderChart(product) {
         ? `<div class="pl-claim-note pl-${claim.tone === "bad" ? "bad" : claim.tone === "good" ? "good" : ""}">
             ${
               claim.tone === "bad"
-                ? `Most recent visit claimed a "was" price never actually observed before — treat that discount with caution.`
+                ? `Most recent visit's "was" claim isn't corroborated by your observed history — treat that discount with caution.`
                 : claim.tone === "good"
                 ? `Most recent visit's "was" claim checks out against your own price history.`
                 : `Most recent visit included a "was" claim, but there isn't enough tracking history yet to confirm or challenge it.`
@@ -325,7 +337,7 @@ function renderChart(product) {
     }
   `;
 
-  wireTooltip(points, history);
+  wireTooltip(points, chartHistory);
 }
 
 function wireTooltip(points, history) {
@@ -362,7 +374,7 @@ function wireTooltip(points, history) {
     if (nearest.w != null) {
       const verdict =
         nearest.claim?.tone === "bad"
-          ? `⚠ claimed "was ${fmt(nearest.w, nearest.c)}" — never seen that high before`
+          ? `⚠ claimed "was ${fmt(nearest.w, nearest.c)}" — not corroborated by your history`
           : nearest.claim?.tone === "good"
           ? `claimed "was ${fmt(nearest.w, nearest.c)}" — matches your history`
           : `claimed "was ${fmt(nearest.w, nearest.c)}" — not enough history yet to check`;
@@ -489,6 +501,26 @@ function buildBarChartSvg(buckets, currency) {
   `;
 }
 
+// Groups products by currency before any totals are computed. Two guards
+// in one: (1) a single product's own history could in principle contain a
+// currency change, so each product's history is first filtered to just
+// its own latest currency; (2) different tracked products can be priced
+// in genuinely different currencies (imported goods, international
+// sites), and summing across those would silently produce a meaningless
+// total rather than an error — grouping instead of summing raw numbers
+// keeps every total honest.
+function groupProductsByCurrency(products) {
+  const groups = new Map();
+  for (const product of products) {
+    const lastCurrency = product.history[product.history.length - 1].c;
+    const cleanHistory = filterSameCurrency(product.history, lastCurrency);
+    const cleanProduct = { ...product, history: cleanHistory };
+    if (!groups.has(lastCurrency)) groups.set(lastCurrency, []);
+    groups.get(lastCurrency).push(cleanProduct);
+  }
+  return groups;
+}
+
 function renderSummary(products, period) {
   const main = document.getElementById("main");
 
@@ -497,7 +529,38 @@ function renderSummary(products, period) {
     return;
   }
 
-  const currency = products[0].history[0].c;
+  const groups = groupProductsByCurrency(products);
+  const currencyList = Array.from(groups.keys());
+
+  main.innerHTML = `
+    <div class="pl-header-row">
+      <div>
+        <h2 class="pl-product-title">Spend summary</h2>
+        <div class="pl-product-domain">Based on prices you've actually observed — not purchase data.${
+          currencyList.length > 1
+            ? ` Tracked items span ${currencyList.length} currencies (${currencyList.join(", ")}) — shown as separate totals below rather than mixed into one number.`
+            : ""
+        }</div>
+      </div>
+    </div>
+    <div class="pl-period-toggle">
+      <button class="pl-period-btn${period === "weekly" ? " pl-period-active" : ""}" data-period="weekly">Weekly</button>
+      <button class="pl-period-btn${period === "monthly" ? " pl-period-active" : ""}" data-period="monthly">Monthly</button>
+    </div>
+    <div id="summary-groups"></div>
+  `;
+
+  const groupsContainer = document.getElementById("summary-groups");
+  for (const [currency, groupProducts] of groups) {
+    groupsContainer.appendChild(renderSummaryGroup(groupProducts, period, currency, currencyList.length > 1));
+  }
+
+  main.querySelectorAll(".pl-period-btn").forEach((btn) => {
+    btn.addEventListener("click", () => renderSummary(products, btn.dataset.period));
+  });
+}
+
+function renderSummaryGroup(products, period, currency, showCurrencyLabel) {
   const currentTotal = products.reduce((sum, p) => sum + p.history[p.history.length - 1].p, 0);
   const bestCaseTotal = products.reduce((sum, p) => sum + Math.min(...p.history.map((h) => h.p)), 0);
   const gap = currentTotal - bestCaseTotal;
@@ -527,17 +590,9 @@ function renderSummary(products, period) {
     })
     .join("");
 
-  main.innerHTML = `
-    <div class="pl-header-row">
-      <div>
-        <h2 class="pl-product-title">Spend summary</h2>
-        <div class="pl-product-domain">Based on prices you've actually observed — not purchase data.</div>
-      </div>
-    </div>
-    <div class="pl-period-toggle">
-      <button class="pl-period-btn${period === "weekly" ? " pl-period-active" : ""}" data-period="weekly">Weekly</button>
-      <button class="pl-period-btn${period === "monthly" ? " pl-period-active" : ""}" data-period="monthly">Monthly</button>
-    </div>
+  const wrap = document.createElement("div");
+  wrap.innerHTML = `
+    ${showCurrencyLabel ? `<h3 class="pl-product-title" style="font-size:14px;margin-top:20px;">${escapeHtml(currency)}</h3>` : ""}
     <div class="pl-summary-cards">
       <div class="pl-summary-card">
         <div class="pl-summary-card-label">Current basket</div>
@@ -566,9 +621,7 @@ function renderSummary(products, period) {
     </table>
   `;
 
-  main.querySelectorAll(".pl-period-btn").forEach((btn) => {
-    btn.addEventListener("click", () => renderSummary(products, btn.dataset.period));
-  });
+  return wrap;
 }
 
 // ---------- Cross-retailer comparison view ----------
@@ -579,7 +632,17 @@ function buildComparisonChartSvg(members) {
   const plotW = CHART_W - PAD_LEFT - PAD_RIGHT;
   const plotH = CHART_H - PAD_TOP - PAD_BOTTOM;
 
-  const allPoints = members.flatMap((m) => m.history);
+  // Defense-in-depth: even though renderComparison already refuses to call
+  // this when members' currencies differ from each other, a single
+  // member's own history could in principle contain a currency change —
+  // filter each to its own latest currency before it ever reaches the
+  // shared axis below.
+  const cleanMembers = members.map((m) => ({
+    ...m,
+    history: filterSameCurrency(m.history, m.history[m.history.length - 1].c),
+  }));
+
+  const allPoints = cleanMembers.flatMap((m) => m.history);
   const times = allPoints.map((h) => h.t);
   const prices = allPoints.map((h) => h.p);
   const minT = Math.min(...times);
@@ -609,7 +672,7 @@ function buildComparisonChartSvg(members) {
     .map((t) => `<text x="${xScale(t).toFixed(1)}" y="${CHART_H - 10}" text-anchor="middle" font-size="9.5" fill="#6B756E">${formatShortDate(t)}</text>`)
     .join("");
 
-  const series = members
+  const series = cleanMembers
     .map((m, i) => {
       const color = COMPARE_PALETTE[i % COMPARE_PALETTE.length];
       const pts = m.history.map((h) => ({ x: xScale(h.t), y: yScale(h.p) }));
@@ -641,24 +704,44 @@ function renderComparison(group, products) {
     return;
   }
 
-  const currentByMember = members.map((m) => ({
-    domain: m.domain,
-    title: m.meta.title,
-    url: m.meta.url,
-    price: m.history[m.history.length - 1].p,
-    currency: m.history[m.history.length - 1].c,
-    low: Math.min(...m.history.map((h) => h.p)),
-  }));
-  const cheapest = currentByMember.slice().sort((a, b) => a.price - b.price)[0];
+  const currentByMember = members.map((m) => {
+    const last = m.history[m.history.length - 1];
+    // Each retailer's own low is computed within its own currency too —
+    // the same currency-mixing risk applies within a single member's
+    // history, not just across members.
+    const ownHistorySameCurrency = filterSameCurrency(m.history, last.c);
+    return {
+      domain: m.domain,
+      title: m.meta.title,
+      url: m.meta.url,
+      price: last.p,
+      currency: last.c,
+      low: Math.min(...ownHistorySameCurrency.map((h) => h.p)),
+    };
+  });
 
-  const rows = currentByMember
-    .slice()
-    .sort((a, b) => a.price - b.price)
+  // Ranking "cheapest" by raw number only makes sense if every retailer is
+  // actually priced in the same currency. Linking a comparison across
+  // countries/currencies is an edge case, but silently ranking $70 USD
+  // below $100 AUD as "cheaper" without conversion would be actively
+  // wrong, not just imprecise — so this disables ranking entirely rather
+  // than pretending the numbers are comparable.
+  const currencies = new Set(currentByMember.map((m) => m.currency));
+  const mixedCurrencies = currencies.size > 1;
+  const cheapest = mixedCurrencies
+    ? null
+    : currentByMember.slice().sort((a, b) => a.price - b.price)[0];
+
+  const sortedForTable = mixedCurrencies
+    ? currentByMember
+    : currentByMember.slice().sort((a, b) => a.price - b.price);
+
+  const rows = sortedForTable
     .map(
       (m, i) => `
       <tr>
         <td><span class="pl-legend-swatch" style="background:${COMPARE_PALETTE[members.findIndex((x) => x.domain === m.domain) % COMPARE_PALETTE.length]}"></span>${escapeHtml(m.domain)}</td>
-        <td>${fmt(m.price, m.currency)}${i === 0 ? " · cheapest now" : ""}</td>
+        <td>${fmt(m.price, m.currency)}${!mixedCurrencies && i === 0 ? " · cheapest now" : ""}</td>
         <td>${fmt(m.low, m.currency)}</td>
         <td><a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">open ↗</a></td>
       </tr>
@@ -673,15 +756,19 @@ function renderComparison(group, products) {
         <div class="pl-product-domain">Comparing ${members.length} retailers you've linked as the same product.</div>
       </div>
     </div>
-    <div class="pl-summary-cards">
-      <div class="pl-summary-card">
-        <div class="pl-summary-card-label">Cheapest right now</div>
-        <div class="pl-summary-card-value pl-good">${fmt(cheapest.price, cheapest.currency)}</div>
-        <div class="pl-summary-card-sub">at ${escapeHtml(cheapest.domain)}</div>
-      </div>
-    </div>
+    ${
+      mixedCurrencies
+        ? `<div class="pl-claim-note pl-bad">These retailers are priced in different currencies (${Array.from(currencies).join(", ")}) — ranking "cheapest" or overlaying them on one chart would compare numbers that aren't actually equivalent, so that's disabled below. Each retailer's own price and low are still shown individually.</div>`
+        : `<div class="pl-summary-cards">
+            <div class="pl-summary-card">
+              <div class="pl-summary-card-label">Cheapest right now</div>
+              <div class="pl-summary-card-value pl-good">${fmt(cheapest.price, cheapest.currency)}</div>
+              <div class="pl-summary-card-sub">at ${escapeHtml(cheapest.domain)}</div>
+            </div>
+          </div>`
+    }
     <div class="pl-chart-wrap">
-      ${buildComparisonChartSvg(members)}
+      ${mixedCurrencies ? `<p class="pl-placeholder">Chart hidden — mixed currencies aren't plottable on one shared axis.</p>` : buildComparisonChartSvg(members)}
     </div>
     <table class="pl-summary-table">
       <thead><tr><th>Retailer</th><th>Current</th><th>Its own low</th><th></th></tr></thead>

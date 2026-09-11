@@ -99,26 +99,89 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
   whichever browser actually recorded the drop. Two people tracking the
   same product in separate browsers get two independent alert streams,
   which is expected, not a bug — there's no shared state to notify from.
-- **Claim checks require ~14 days of tracking before flagging "inflated."**
-  A "was $X" claim you've never personally seen corroborated could mean
-  the claim is fake — or it could just mean you started tracking the item
-  after a genuine discount had already begun. Fewer than 14 days of
-  history reports "can't verify" either way rather than guessing; only a
-  longer window that still never reaches the claimed price is treated as
-  a real red flag. The threshold is a judgment call, not a precise
-  science — it's `MIN_DAYS_FOR_INFLATED_VERDICT` in `shared.js`, used by
-  `content.js`, `history.js`, and `popup.js` — tune it there if you want
-  it stricter or looser.
-- **Spend summary assumes one currency across everything tracked.** It
-  sums raw price numbers without currency conversion — fine if everything
-  you track is in AUD (or whatever one currency), but would silently
-  produce a meaningless total if you ever tracked items priced in
-  genuinely different currencies. Worth fixing properly (group by
-  currency, show separate totals) if that ever becomes a real scenario.
+- **Claim checks require both ~14 days of tracking AND at least 4 distinct
+  observations before flagging "inflated."** A "was $X" claim you've never
+  personally seen corroborated could mean the claim is fake — or it could
+  just mean you started tracking the item after a genuine discount had
+  already begun, or that you simply haven't checked often enough yet for
+  thin data to mean anything (two visits two weeks apart span 14 days but
+  don't establish much about what happened in between). Short/thin
+  history reports "can't verify" rather than guessing; wording is
+  deliberately evidential ("not corroborated by your observed history")
+  rather than accusatory, since ruling a claim uncorroborated and proving
+  it's actually inflated are different strengths of evidence. Both
+  thresholds are judgment calls — `MIN_DAYS_FOR_INFLATED_VERDICT` and
+  `MIN_OBSERVATIONS_FOR_INFLATED_VERDICT` in `shared.js`, used by
+  `content.js`, `history.js`, and `popup.js` — tune them there if needed.
+- **Spend summary groups by currency rather than assuming one.** If
+  tracked items span more than one currency, the summary now renders a
+  separate total per currency instead of silently summing incompatible
+  numbers into one meaningless figure.
 - **Comparisons are manual and don't auto-update membership.** Linking is
   a one-time action — if a retailer stops selling an item or you start
   tracking a better match, you'll need to delete the old comparison and
   create a new one; there's no "edit members" flow yet, just create and
   delete. Also, if a comparison somehow links two entries from the same
   domain, they'll render in the same series color on the chart — a minor
-  cosmetic quirk, not a data problem.
+  cosmetic quirk, not a data problem. If linked retailers turn out to use
+  different currencies, ranking and the overlay chart are disabled with an
+  explanation rather than pretending the numbers are comparable.
+- **Cross-tab write races are only partially mitigated.** `recordObservation`
+  is a read-modify-write against `chrome.storage.local`; this content
+  script serializes its own concurrent calls (it deliberately runs a
+  `MutationObserver` and a poll simultaneously, which could otherwise race
+  against itself), but two separate *browser tabs* observing the same
+  product at the same moment could still each read stale history and one
+  write could clobber the other's. Properly closing that gap means
+  centralizing ledger writes in the background service worker instead of
+  each content script writing directly — a bigger architectural change
+  than this pass covers, and a low-probability scenario for personal use,
+  but a real one worth fixing before this handles anything higher-stakes.
+- **Chrome Web Store packaging isn't done.** The zip here is structured
+  for `chrome://extensions` → Load Unpacked (folder-based), not Store
+  submission — a real submission needs `manifest.json` at the zip root
+  rather than nested inside a folder. Not relevant unless you actually
+  decide to publish this.
+
+## Hardening pass (responding to an adversarial code review)
+
+An external review of 0.8.1 found several real defects that specifically
+undermined the thing this extension is supposed to be trustworthy about —
+historical price accuracy. Every finding was independently reproduced
+before fixing (not just taken on faith) and confirmed fixed after:
+
+- **Price misparsing with thousands separators** — the old regex-based
+  parsing truncated `$1,299.99` to `$1` and similar. Replaced with a
+  canonical `parsePriceAmount()` in `shared.js` that correctly handles
+  comma/dot/space thousands separators and comma/dot decimals, and
+  rejects genuinely ambiguous input (e.g. `"1,2,3"`) instead of guessing.
+  Every price-extraction site in `content.js` now routes through it.
+- **Currency-blind price comparisons** — lows, highs, "new low" alerts,
+  and claim checks used to compare raw numbers regardless of currency, so
+  a currency change on a page could produce a fictional "new low."
+  `filterSameCurrency()` now gates every comparison to matching currency
+  only.
+- **Stored HTML injection via page-controlled currency** — a malformed or
+  malicious `priceCurrency` value from a page's own JSON-LD could reach
+  `innerHTML` unescaped through `fmt()`'s fallback branch.
+  `sanitizeCurrency()` now validates currency down to a plain 3-letter
+  code at every point one is captured from page data, closing this at the
+  source.
+- **Notification click targets could silently vanish** — the
+  notification→URL mapping lived in a plain in-memory object in the
+  background service worker, which MV3 can terminate and respawn at any
+  time, wiping it. Moved to `chrome.storage.session`, which survives
+  worker restarts for the life of the browser session.
+- **A watcher-lifecycle timer bug** — the DOM watcher's 45-minute safety
+  cap wasn't tracked, so restarting the watcher could leave a stale timer
+  that killed the new instance early. Now tracked and cancelled properly.
+- **JSON-LD candidate selection took the first match blindly** — a page
+  with multiple `Product` objects (variants, related items) could pick
+  the wrong one, and an `AggregateOffer.lowPrice` (a range floor) was
+  treated the same as an exact displayed price. Candidates are now scored:
+  an exact price outranks a range floor, and a name matching the page
+  outranks one that doesn't.
+
+Not everything was fully closed — see the cross-tab write race and Store
+packaging notes above for what's accepted as a known gap rather than
+fixed, and why.
