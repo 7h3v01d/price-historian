@@ -93,3 +93,50 @@ chrome.runtime.onMessage.addListener((message) => {
   chrome.storage.local.set({ unseenAlertCount: 0 });
   chrome.action.setBadgeText({ text: "" });
 });
+
+// ---------- Legacy storage migration ----------
+// sanitizeCurrency() closes the injection path for every observation
+// recorded from this version onward. But chrome.storage.local survives
+// ordinary extension updates (it's only cleared if the extension is
+// removed entirely), so any currency value already persisted by an older
+// version — before this validation existed — would otherwise sit in
+// storage indefinitely, still reachable by fmt() on every future render.
+// This walks existing history entries once per update and sanitizes any
+// currency value that doesn't pass validation, rather than leaving
+// pre-existing data as the one path that's still unguarded.
+async function migrateLegacyCurrencyData() {
+  const all = await chrome.storage.local.get(null);
+  const updates = {};
+  let changedCount = 0;
+
+  for (const key of Object.keys(all)) {
+    if (!key.startsWith("history:")) continue;
+    const entries = all[key];
+    if (!Array.isArray(entries)) continue;
+
+    let changed = false;
+    const cleaned = entries.map((entry) => {
+      if (sanitizeCurrency(entry.c, null) === entry.c) return entry;
+      changed = true;
+      // Domain isn't reliably recoverable from the storage key alone in
+      // every case, so fall back to a plain "unknown" marker rather than
+      // guessing — fmt() already renders that honestly.
+      return { ...entry, c: sanitizeCurrency(entry.c, null) };
+    });
+
+    if (changed) {
+      updates[key] = cleaned;
+      changedCount++;
+    }
+  }
+
+  if (changedCount > 0) {
+    await chrome.storage.local.set(updates);
+  }
+}
+
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === "update") {
+    migrateLegacyCurrencyData();
+  }
+});

@@ -6,30 +6,10 @@ function formatFullDate(t) {
   return new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
-// Mirrors the logic in content.js: was this point's claimed "was" price
-// actually corroborated by anything observed before it? A short tracking
-// window (by days OR by number of distinct checks) before this point
-// reports "neutral" rather than "bad" — not having seen the higher price
-// yet doesn't mean it's fake, it might just mean tracking started partway
-// through an already-discounted period, or there simply isn't much data
-// yet either way.
-// (MIN_DAYS_FOR_INFLATED_VERDICT / MIN_OBSERVATIONS_FOR_INFLATED_VERDICT
-// come from shared.js.)
-
-function evaluateClaimAt(history, i) {
-  const point = history[i];
-  if (point.w == null) return null;
-  // Only compare within the same currency as this point — mixing currency
-  // series would make "observed max" meaningless.
-  const past = history.slice(0, i).filter((h) => h.c === point.c);
-  if (!past.length) return { tone: "neutral" };
-  const observedMax = Math.max(...past.map((h) => h.p));
-  const tolerance = point.w * 0.03;
-  if (observedMax >= point.w - tolerance) return { tone: "good" };
-  const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
-  const hasEnoughEvidence = daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT && past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
-  return hasEnoughEvidence ? { tone: "bad" } : { tone: "neutral" };
-}
+// evaluateClaimAt() comes from shared.js — it's the single canonical claim
+// evaluator used by content.js, history.js, and popup.js. It used to be
+// duplicated here; that duplication is exactly what let this file and
+// popup.js drift out of sync in an earlier version.
 
 async function loadAllProducts() {
   const all = await chrome.storage.local.get(null);

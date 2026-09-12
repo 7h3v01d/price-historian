@@ -46,7 +46,15 @@
     for (const suffix of Object.keys(TLD_CURRENCY)) {
       if (host.endsWith(suffix)) return TLD_CURRENCY[suffix];
     }
-    return "USD";
+    // No TLD signal — genuinely unknown, not "probably USD." A .com
+    // retailer can localize prices for AU/UK/etc visitors with no
+    // structured currency metadata at all; guessing USD would mislabel
+    // real evidence rather than honestly recording that we don't know.
+    // fmt() and filterSameCurrency() both handle a null currency
+    // correctly (displaying "(currency unknown)" instead of a wrong
+    // label, and still grouping same-unknown-currency observations
+    // together for comparison purposes).
+    return null;
   }
 
   function collectProducts(node, out, depth = 0) {
@@ -63,6 +71,23 @@
   function extractOfferPrice(offers) {
     if (!offers) return null;
     const list = Array.isArray(offers) ? offers : [offers];
+
+    // A Product with multiple offers at genuinely different exact prices
+    // (e.g. size/color variants each priced separately) is ambiguous from
+    // JSON-LD alone — there's no reliable way to tell which variant
+    // corresponds to what's actually shown on this specific page.
+    // Confidently picking the first one risks silently tracking the
+    // wrong variant's price; rejecting is safer than guessing.
+    const distinctExactPrices = new Set(
+      list
+        .map((o) => o.price)
+        .filter((p) => p !== undefined && p !== null && p !== "")
+        .map((p) => parsePriceAmount(String(p)))
+        .filter((p) => p != null)
+        .map((p) => p.toFixed(2))
+    );
+    if (distinctExactPrices.size > 1) return null;
+
     for (const offer of list) {
       // An exact `price` is a real, displayed price for this offer. A
       // `lowPrice` (from an AggregateOffer, e.g. across sellers or
@@ -102,15 +127,22 @@
     // A page can embed multiple Product objects (variants, related items,
     // a whole listing's worth of JSON-LD). Taking "the first one with any
     // usable offer" risked picking the wrong one entirely. Score every
-    // candidate instead and take the best: an exact displayed price
-    // outranks a range floor, and a name that actually matches the page
-    // outranks one that doesn't.
+    // candidate instead and take the best.
+    //
+    // Identity correspondence dominates price-quality, not the other way
+    // around: a candidate whose name actually matches the page (weight
+    // ×10) always outranks an unrelated candidate that merely has an
+    // exact price (+2) rather than a range floor (+0) — an earlier
+    // version weighted these the other way and could pick a completely
+    // unrelated recommended-item's exact price over the actual product's
+    // range-floor price, which is a worse failure than the one this
+    // scoring was originally built to prevent.
     let best = null;
     let bestScore = -Infinity;
     for (const p of products) {
       const priceInfo = extractOfferPrice(p.offers);
       if (!priceInfo) continue;
-      const score = (priceInfo.isExact ? 2 : 0) + titleSimilarity(p.name, pageTitle);
+      const score = titleSimilarity(p.name, pageTitle) * 10 + (priceInfo.isExact ? 2 : 0);
       if (score > bestScore) {
         bestScore = score;
         best = { p, priceInfo };
@@ -322,12 +354,16 @@
       const num = extractPriceFromText(el.textContent);
       if (num == null) return;
 
+      // Build the product (including its claimed was-price, if any) before
+      // the dedupe check — a claim appearing/disappearing/changing with the
+      // price otherwise unchanged is still a real change worth recording,
+      // so it needs to be part of the key, not just price/title/pathname.
+      const product = buildMetaProduct(num, inferCurrencyFromDomain());
       const title = currentTitleGuess();
-      const key = `${location.pathname}::${title}::${num}`;
+      const key = `${location.pathname}::${title}::${num}::${product.claimedWasPrice ?? "none"}`;
       if (key === lastKey) return; // no meaningful change since last observation
       lastKey = key;
 
-      const product = buildMetaProduct(num, inferCurrencyFromDomain());
       const { history, isNewLow, priorLow } = await recordObservation(product);
       renderBadge(product, history);
       if (isNewLow) notifyNewLow(product, priorLow);
@@ -433,10 +469,17 @@
 
     const now = Date.now();
     const last = history[history.length - 1];
-    // Avoid spamming duplicate points on the same day at the same price —
-    // but a currency change is a real change even if the number matches.
+    const incomingClaim = product.claimedWasPrice ?? null;
+    // Avoid spamming duplicate points on the same day at the exact same
+    // reading — but a currency change OR a claim appearing/disappearing/
+    // changing is a real change even if the price itself matches. A claim
+    // is evidence in its own right (it's what the badge and history chart
+    // check against future visits), so silently dropping or preserving a
+    // stale one on the "no price change" fast path would let the ledger
+    // lie about what the retailer actually displayed at that moment.
     const sameDay = last && new Date(last.t).toDateString() === new Date(now).toDateString();
-    const sameReading = last && last.p === product.price && last.c === product.currency;
+    const sameReading =
+      last && last.p === product.price && last.c === product.currency && (last.w ?? null) === incomingClaim;
     if (!last || !sameReading || !sameDay) {
       history.push({
         p: product.price,
@@ -445,7 +488,7 @@
         // "w" = the retailer's own claimed was/RRP price at the time, if any.
         // Kept per-datapoint so a claim can be checked against your actual
         // observed history, not just today's number.
-        w: product.claimedWasPrice ?? null,
+        w: incomingClaim,
       });
     }
     // Cap history length so storage doesn't grow unbounded.
@@ -510,68 +553,127 @@
   }
 
   // Checks a retailer's claimed "was $X" against what THIS browser has
-  // actually seen for the item — the whole point of the extension.
-  // `history` includes today's just-recorded point, so we look at
-  // everything before it to judge whether the claim is independently
-  // corroborated by prior visits, not by today's own claim.
-  //
-  // Important: "never seen it that high" only means something if we've
-  // been watching long enough — and often enough — to plausibly have
-  // caught it. Two visits two weeks apart technically span 14 days but
-  // don't actually establish much about what happened in between, so this
-  // requires both a minimum day-span AND a minimum number of distinct
-  // observations before treating an uncorroborated claim as a real red
-  // flag. If tracking started partway through an already-discounted
-  // period, our own history will never reach the pre-discount price —
-  // that's a gap in OUR data, not evidence the retailer's claim is false.
-  // The wording below is deliberately evidential ("not corroborated by
-  // your observed history") rather than accusatory ("fake") — thin
-  // observation data can rule a claim uncorroborated, but proving it's
-  // actually inflated would need more sampling than a browser extension
-  // casually browsing a site can gather.
-  // (MIN_DAYS_FOR_INFLATED_VERDICT / MIN_OBSERVATIONS_FOR_INFLATED_VERDICT
-  // come from shared.js.)
-
+  // actually seen for the item — the whole point of the extension. The
+  // actual evidence logic (currency filtering, day-span and observation-
+  // count thresholds) lives in evaluateClaimAt() in shared.js, used
+  // identically by the badge, history chart, and popup list. This is just
+  // the badge's own wording built from that shared, structured result —
+  // an earlier version had each surface re-implement the logic itself,
+  // and they drifted out of sync when only some got updated.
   function evaluateClaim(product, history) {
-    if (product.claimedWasPrice == null) return null;
-    const sameCurrencyHistory = filterSameCurrency(history, product.currency);
-    const past = sameCurrencyHistory.slice(0, -1);
-    const was = product.claimedWasPrice;
+    // By the time this runs, `history` already has product's current
+    // observation as its last point (recordObservation pushed it before
+    // renderBadge was called), with matching .w/.c/.p — so evaluating at
+    // the last index reads today's actual claim, not a stale one.
+    const result = evaluateClaimAt(history, history.length - 1);
+    if (!result) return null;
+    const { tone, was, currency, observedMax, pastCount, daysTracked } = result;
 
-    if (past.length < 1) {
+    if (tone === "neutral" && pastCount === 0) {
       return {
-        tone: "neutral",
-        text: `Claims "was ${fmt(was, product.currency)}" — first time tracking this, can't verify yet.`,
+        tone,
+        text: `Claims "was ${fmt(was, currency)}" — first time tracking this, can't verify yet.`,
       };
     }
-
-    const observedMax = Math.max(...past.map((h) => h.p));
-    const tolerance = was * 0.03; // small wiggle room for rounding/cent differences
-    if (observedMax >= was - tolerance) {
+    if (tone === "good") {
       return {
-        tone: "good",
-        text: `Checks out — you've seen it at ${fmt(observedMax, product.currency)} before.`,
+        tone,
+        text: `Checks out — you've seen it at ${fmt(observedMax, currency)} before.`,
       };
     }
-
-    const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
-    const hasEnoughSpan = daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT;
-    const hasEnoughObservations = past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
-    if (!hasEnoughSpan || !hasEnoughObservations) {
+    if (tone === "neutral") {
       return {
-        tone: "neutral",
-        text: `Only ${past.length} check(s) over ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, product.currency)}" claim.`,
+        tone,
+        text: `Only ${pastCount} check(s) over ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, currency)}" claim.`,
       };
     }
-
     return {
-      tone: "bad",
-      text: `${past.length} checks over ${Math.round(daysTracked)} days, never above ${fmt(observedMax, product.currency)} — the "was ${fmt(was, product.currency)}" claim isn't corroborated by your observed history.`,
+      tone,
+      text: `${pastCount} checks over ${Math.round(daysTracked)} days, never above ${fmt(observedMax, currency)} — the "was ${fmt(was, currency)}" claim isn't corroborated by your observed history.`,
     };
   }
 
+  // The badge lives inside a *closed* Shadow DOM. Content scripts share the
+  // page's real DOM with the page's own scripts — that's the whole
+  // mechanism that lets this badge render inline at all — which also means
+  // a page script could previously do
+  // document.querySelector("#price-ledger-badge")?.textContent and read
+  // your private price history (low/high/check-count/claim verdict), or
+  // rewrite the badge to display a fake "checks out" verdict for a claim
+  // that doesn't. A closed shadow root means `host.shadowRoot` returns
+  // null to every script except the one that created it, so the content
+  // itself is no longer readable or rewritable via ordinary DOM queries.
+  //
+  // This does NOT make the badge fully tamper-proof: a page can still see
+  // the host element exists, and can still remove, hide, or reposition it
+  // (there's no DOM API that prevents an ancestor page from manipulating
+  // any injected element's existence). That's an accepted, unavoidable
+  // limit of content-script UI — which is exactly why the badge is a
+  // convenience surface, not the authoritative one. The popup and history
+  // page render entirely within extension-owned UI with no page DOM
+  // involved at all, and are the surfaces to trust if you ever suspect a
+  // page might be interfering with the inline badge.
+  // Adapted from the old content.css — that file targeted the badge via a
+  // page-level `#price-ledger-badge` selector, which no longer reaches
+  // anything now that the badge lives inside a shadow root (external
+  // stylesheets don't cross the shadow boundary). `:host` replaces the
+  // old ID selector for styling the badge's own box; everything else is
+  // unchanged, just no longer needing the ID prefix since shadow DOM
+  // scoping already isolates these class names from the page.
+  const BADGE_SHADOW_CSS = `
+    :host {
+      all: initial;
+      position: fixed;
+      bottom: 18px;
+      right: 18px;
+      z-index: 2147483647;
+      width: 236px;
+      background: #101814;
+      border: 1px solid #2a362f;
+      border-radius: 10px;
+      padding: 10px 12px 11px;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+      font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      color: #EDEAE0;
+      animation: pl-rise 220ms ease-out;
+      display: block;
+      box-sizing: border-box;
+    }
+    :host(.pl-alert) { border-color: #6b3630; }
+    @keyframes pl-rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .pl-row { display: flex; align-items: center; width: 100%; box-sizing: border-box; }
+    .pl-head { gap: 6px; margin-bottom: 6px; }
+    .pl-dot { width: 6px; height: 6px; border-radius: 50%; background: #E8A33D; flex: none; }
+    :host(.pl-good) .pl-dot { background: #3FA796; }
+    .pl-title {
+      font-size: 10px; letter-spacing: 0.02em; color: #A8AFA6; flex: 1;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .pl-close { all: unset; cursor: pointer; color: #6B756E; font-size: 13px; line-height: 1; padding: 0 2px; }
+    .pl-close:hover { color: #EDEAE0; }
+    .pl-price-row { justify-content: space-between; margin-bottom: 4px; }
+    .pl-price { font-size: 18px; font-weight: 600; color: #EDEAE0; letter-spacing: -0.01em; }
+    .pl-spark { width: 78px; height: 24px; color: #E8A33D; flex: none; }
+    :host(.pl-good) .pl-spark { color: #3FA796; }
+    .pl-verdict { font-size: 11px; color: #E8A33D; margin-bottom: 3px; }
+    :host(.pl-good) .pl-verdict { color: #3FA796; }
+    .pl-meta { font-size: 9.5px; color: #6B756E; line-height: 1.4; }
+    .pl-claim {
+      font-size: 9.5px; line-height: 1.4; margin-top: 6px; padding-top: 6px;
+      border-top: 1px dashed #2a362f; white-space: normal;
+    }
+    .pl-claim-good { color: #3FA796; }
+    .pl-claim-neutral { color: #6B756E; }
+    .pl-claim-bad { color: #E2574C; font-weight: 600; }
+  `;
+
+  let badgeShadowRoot = null;
+
   function renderBadge(product, history) {
-    document.getElementById("price-ledger-badge")?.remove();
+    document.getElementById("price-ledger-badge-host")?.remove();
 
     // Same-currency filtering matters here too — a badge showing "low
     // $65" against a $100 history that switched currency mid-stream would
@@ -584,11 +686,14 @@
     const diffFromLow = product.price - low;
     const claim = evaluateClaim(product, history);
 
-    const badge = document.createElement("div");
-    badge.id = "price-ledger-badge";
-    let stateClass = isAtLow ? " pl-good" : "";
-    if (claim?.tone === "bad") stateClass = " pl-alert";
-    badge.className = "pl-badge" + stateClass;
+    const host = document.createElement("div");
+    host.id = "price-ledger-badge-host";
+    let stateClass = isAtLow ? "pl-good" : "";
+    if (claim?.tone === "bad") stateClass = "pl-alert";
+    if (stateClass) host.classList.add(stateClass);
+
+    const shadow = host.attachShadow({ mode: "closed" });
+    badgeShadowRoot = shadow;
 
     const verdict = isAtLow
       ? sameCurrencyHistory.length > 1
@@ -596,7 +701,8 @@
         : "First time tracking this"
       : `${fmt(diffFromLow, product.currency)} above your low`;
 
-    badge.innerHTML = `
+    shadow.innerHTML = `
+      <style>${BADGE_SHADOW_CSS}</style>
       <div class="pl-row pl-head">
         <span class="pl-dot"></span>
         <span class="pl-title">${escapeHtml(truncate(product.title, 34))}</span>
@@ -615,8 +721,8 @@
       ${claim ? `<div class="pl-row pl-claim pl-claim-${claim.tone}">${escapeHtml(claim.text)}</div>` : ""}
     `;
 
-    badge.querySelector(".pl-close").addEventListener("click", () => badge.remove());
-    document.documentElement.appendChild(badge);
+    shadow.querySelector(".pl-close").addEventListener("click", () => host.remove());
+    document.documentElement.appendChild(host);
   }
 
   function truncate(str, n) {
@@ -626,7 +732,7 @@
   // ---------- 4. Run ----------
 
   async function run() {
-    document.getElementById("price-ledger-badge")?.remove();
+    document.getElementById("price-ledger-badge-host")?.remove();
 
     let product = detectFromJsonLd();
     if (!product) {

@@ -185,3 +185,75 @@ before fixing (not just taken on faith) and confirmed fixed after:
 Not everything was fully closed — see the cross-tab write race and Store
 packaging notes above for what's accepted as a known gap rather than
 fixed, and why.
+
+### Second hardening pass
+
+A follow-up adversarial review of 0.9.0 found the first pass had
+introduced a real regression and left one architectural gap unaddressed.
+Both were independently reproduced before fixing, same as the first round:
+
+- **`popup.js` had silently drifted out of sync.** The first hardening
+  pass updated the currency-filtering and claim-threshold logic in
+  `content.js` and `history.js` but missed `popup.js` entirely — it kept
+  comparing prices across currencies and flagging claims off a bare
+  14-day span with no observation-count floor, so the three surfaces
+  could (and, when tested, did) disagree about the same underlying fact.
+  Fixed properly this time, not just patched: `evaluateClaimAt()` moved
+  into `shared.js` as the single canonical implementation, and
+  `content.js`, `history.js`, and `popup.js` now all call it rather than
+  each maintaining their own copy. There is structurally only one place
+  this logic can live now, which is what actually prevents this class of
+  bug — not "try to remember to update all three files."
+- **The badge exposed private history data to the page it's tracking.**
+  The badge was appended directly into the page's own DOM, which content
+  scripts share with the page's own JavaScript — meaning a retailer's
+  page script could read the badge's low/high/check-count/claim text via
+  a plain `document.querySelector`, or rewrite it to show a fake "checks
+  out" verdict. The badge now renders inside a **closed Shadow DOM**:
+  verified with a real test that `host.shadowRoot` returns `null` to
+  external scripts (even `host.textContent` returns empty), while the
+  content script's own retained reference still works normally. This does
+  **not** make the badge fully tamper-proof — a page can still see the
+  host element exists and remove/hide/reposition it, which no DOM API
+  can prevent. That's exactly why the popup and history page are the
+  authoritative surfaces if you ever suspect a page is interfering with
+  the inline badge — they're pure extension UI with no page DOM
+  involvement at all.
+- **JSON-LD candidate scoring had the weights inverted.** The scoring
+  added in the first pass gave an exact price +2 and a title match at
+  most +1, so an unrelated recommended-item with an exact price could
+  outrank the actual product with a matching name but a range-floor
+  price — precisely the failure mode the scoring was supposed to prevent.
+  Rebalanced so title/identity correspondence (×10) dominates
+  price-quality (+2): reproduced the review's exact scenario and
+  confirmed the correct candidate now wins. Also added a check for
+  variant-priced products (multiple exact offers at different prices on
+  one `Product`) — rejects rather than confidently guessing which
+  variant's price applies.
+- **A claim appearing or disappearing without the price changing used to
+  vanish.** Same-day deduplication only compared price and currency, not
+  the claimed "was" price — so a claim that appeared in the afternoon
+  with the morning's price unchanged was silently dropped, and vice
+  versa. The claimed price is now part of observation identity in both
+  `recordObservation`'s dedup check and the DOM watcher's own dedupe key.
+- **`fmt()` is now intrinsically safe**, not just safe because every known
+  caller sanitizes first — it validates currency internally and never
+  echoes an unvalidated string, closing the gap for any future call site
+  that forgets to sanitize, and for currency values already persisted by
+  a pre-sanitization version. A migration in `background.js` also
+  sanitizes any such legacy data on update (`chrome.storage.local`
+  survives ordinary updates, so old poisoned values wouldn't otherwise
+  self-heal).
+- **Currency inference no longer silently assumes USD.** A `.com`
+  retailer that localizes prices for AU/UK/etc visitors with no
+  structured currency metadata used to get labeled USD by default.
+  Genuinely unknown currency is now recorded as `null` and rendered
+  honestly as "(currency unknown)" rather than a wrong label.
+- **A real test suite now exists** (`test/run-tests.js`, run with
+  `node test/run-tests.js`) — 38 checks covering the price parser,
+  currency isolation, and claim-evidence thresholds, plus a structural
+  check that would have specifically caught the `popup.js` drift bug
+  above (verified: ran it against a reconstruction of the old broken
+  file, and it fails as expected). This is a genuine start, not a
+  finished suite — it doesn't yet cover JSON-LD scoring, the DOM
+  watcher's dedupe key, or true end-to-end integration testing.

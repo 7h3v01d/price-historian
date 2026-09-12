@@ -3,11 +3,24 @@
 // popup.js/history.js (as a plain <script> tag) so all three can use these
 // without three copy-pasted definitions drifting out of sync.
 
+// fmt() is intrinsically safe against untrusted currency strings — it
+// sanitizes internally rather than trusting callers to have done it
+// already. This matters even though every known page-controlled ingestion
+// point now sanitizes currency before storage: it closes the gap for (a)
+// any future call site that forgets to sanitize first, and (b) currency
+// values already persisted by an older version before this validation
+// existed — chrome.storage.local survives ordinary extension updates, so
+// stale unsanitized data can still reach fmt() after upgrading.
 function fmt(price, currency) {
+  const safeCurrency = sanitizeCurrency(currency, null);
+  if (!safeCurrency) {
+    // Never echo an unvalidated currency string, even in a fallback path.
+    return `${price.toFixed(2)} (currency unknown)`;
+  }
   try {
-    return new Intl.NumberFormat(undefined, { style: "currency", currency }).format(price);
+    return new Intl.NumberFormat(undefined, { style: "currency", currency: safeCurrency }).format(price);
   } catch {
-    return `${currency} ${price.toFixed(2)}`;
+    return `${safeCurrency} ${price.toFixed(2)}`;
   }
 }
 
@@ -110,8 +123,53 @@ function filterSameCurrency(history, currency) {
 // gets flagged as inflated, rather than reported as "can't verify yet."
 // Requiring both guards against thin evidence: two visits two weeks apart
 // technically span 14 days but don't actually establish much about what
-// happened in between. See content.js's evaluateClaim for full reasoning.
-// Kept here so content.js, history.js, and popup.js can't drift out of
-// sync on the thresholds.
+// happened in between.
 const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
 const MIN_OBSERVATIONS_FOR_INFLATED_VERDICT = 4;
+
+// ---------- Canonical claim evaluation ----------
+// The single source of truth for "does this was-price claim check out
+// against observed history." An earlier version had this logic
+// re-implemented separately in content.js, history.js, and popup.js —
+// when the evidence thresholds were tightened, only two of the three got
+// updated, and the three surfaces started disagreeing about the same
+// underlying fact. There is now exactly one implementation; every surface
+// calls this and builds its own wording from the structured result rather
+// than re-deriving the tone itself.
+//
+// `history` is the full array for one product (ascending by time,
+// {p, c, t, w} per point). `index` is the point being evaluated — pass
+// history.length - 1 to evaluate "as of the most recent observation."
+// Returns null if that point made no claim at all.
+function evaluateClaimAt(history, index) {
+  const point = history[index];
+  if (!point || point.w == null) return null;
+
+  // Only compare within the same currency as this point — mixing
+  // currency series would make "observed max" meaningless.
+  const past = history.slice(0, index).filter((h) => h.c === point.c);
+  const was = point.w;
+
+  if (!past.length) {
+    return { tone: "neutral", was, currency: point.c, observedMax: null, pastCount: 0, daysTracked: 0 };
+  }
+
+  const observedMax = Math.max(...past.map((h) => h.p));
+  const tolerance = was * 0.03; // small wiggle room for rounding/cent differences
+  if (observedMax >= was - tolerance) {
+    return { tone: "good", was, currency: point.c, observedMax, pastCount: past.length, daysTracked: null };
+  }
+
+  const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
+  const hasEnoughEvidence =
+    daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT && past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
+
+  return {
+    tone: hasEnoughEvidence ? "bad" : "neutral",
+    was,
+    currency: point.c,
+    observedMax,
+    pastCount: past.length,
+    daysTracked,
+  };
+}

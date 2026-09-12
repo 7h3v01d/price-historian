@@ -25,10 +25,17 @@ async function main() {
   list.innerHTML = "";
   for (const { domain, meta, history } of entries) {
     const last = history[history.length - 1];
-    const prices = history.map((h) => h.p);
-    const low = Math.min(...prices);
+    // Only compare within the current currency — the same fix applied to
+    // the badge and history chart. An earlier version of this file
+    // predated that fix and compared raw prices across currencies.
+    const sameCurrencyHistory = filterSameCurrency(history, last.c);
+    const low = Math.min(...sameCurrencyHistory.map((h) => h.p));
     const isLow = last.p <= low + 0.001;
-    const claimFlag = evaluateClaimFlag(history);
+    // evaluateClaimAt() comes from shared.js — the same canonical
+    // evaluator the badge and history chart use, so this can't silently
+    // disagree with them about the same claim the way it used to.
+    const claim = evaluateClaimAt(history, history.length - 1);
+    const claimFlag = claim?.tone === "bad";
 
     const row = document.createElement("div");
     row.className = "pl-item";
@@ -43,31 +50,12 @@ async function main() {
           isLow ? "at its low" : `low was ${fmt(low, last.c)}`
         }</span>
       </div>
-      ${claimFlag ? `<div class="pl-item-flag">⚠ "was" price never seen — likely inflated</div>` : ""}
+      ${claimFlag ? `<div class="pl-item-flag">⚠ "was" claim not corroborated by your history</div>` : ""}
     `;
     row.addEventListener("click", () => chrome.tabs.create({ url: meta.url }));
     row.style.cursor = "pointer";
     list.appendChild(row);
   }
-}
-
-// Mirrors content.js's claim logic: only flags when the claim is both
-// uncorroborated AND we've tracked long enough for that to mean something.
-// A short tracking window reports nothing here — same reasoning as the
-// badge and history chart: an unseen high price might just mean we started
-// watching after a real discount already began, not that it's fake.
-// (MIN_DAYS_FOR_INFLATED_VERDICT comes from shared.js.)
-
-function evaluateClaimFlag(history) {
-  const last = history[history.length - 1];
-  if (!last || last.w == null) return false;
-  const past = history.slice(0, -1);
-  if (!past.length) return false;
-  const observedMax = Math.max(...past.map((h) => h.p));
-  const tolerance = last.w * 0.03;
-  if (observedMax >= last.w - tolerance) return false;
-  const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
-  return daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT;
 }
 
 main();
