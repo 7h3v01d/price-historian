@@ -1,27 +1,41 @@
 // Price Ledger — regression test suite
 //
-// Run with: node test/run-tests.js
+// Setup: npm install (installs jsdom, a dev-only dependency used for
+// real DOM-based behavioral tests — not part of the shipped extension).
+// Run with: node test/run-tests.js (or npm test)
 //
 // Covers the canonical logic in shared.js: the price parser, currency
-// sanitization/isolation, and the claim evaluator. This exists because an
+// sanitization/isolation, the claim evaluator, JSON-LD candidate
+// selection, and claim-proximity scoring. This exists because an
 // adversarial review found that content.js, history.js, and popup.js had
 // drifted out of sync on claim logic that was supposed to be shared —
 // exactly the kind of regression a small test suite catches immediately
-// and a human reviewing three files by eye can miss.
-//
-// What this does NOT cover yet, and should before this is called
-// comprehensive: JSON-LD candidate scoring, the DOM watcher's dedupe key,
-// and the popup/history/content.js integration points themselves (this
-// suite tests shared.js directly, not whether each consumer actually
-// calls it correctly — that still requires reading the calling code).
+// and a human reviewing three files by eye can miss. A later review round
+// also found that source-pattern tests (checking that certain code exists
+// in content.js, rather than exercising it) couldn't actually prove the
+// detection behaved correctly — the JSON-LD selection and claim-proximity
+// logic were extracted into shared.js specifically so real behavioral
+// tests against plain data and DOM fixtures could replace those
+// source-pattern checks where it mattered most.
 
 const assert = require("assert");
 const path = require("path");
 const fs = require("fs");
 
+let JSDOM;
+try {
+  ({ JSDOM } = require("jsdom"));
+} catch {
+  console.error("jsdom isn't installed — run `npm install` in this directory first (dev-only, not part of the shipped extension).");
+  process.exit(1);
+}
+
 // shared.js is a plain script (not a module) meant to run in a browser
 // content-script/extension-page context. It only touches `document` in
-// escapeHtml(), which nothing here calls — everything else is pure.
+// escapeHtml(), which nothing here calls — everything else is pure or
+// (for proximityHops) operates on whatever DOM elements are passed to it
+// regardless of the global `document`, so real jsdom elements can be used
+// directly in tests without needing to swap this stub out.
 global.document = {
   createElement: () => {
     throw new Error("escapeHtml() was called in a test that didn't expect DOM access");
@@ -234,23 +248,15 @@ test("four same-day observation rows (e.g. claim edits) do not satisfy the obser
 });
 
 
-console.log("\nStructural checks — content.js safety patterns (see note below on why these are structural, not unit tests)");
-// titleSimilarity/JSON-LD scoring and findClaimedWasPrice's scoping live
-// inside content.js's IIFE closure, tied to `document`/`location` browser
-// globals — not independently callable from a plain Node test the way
-// shared.js's exported-by-convention functions are. Extracting them to
-// shared.js so they could be unit tested properly is the right long-term
-// fix; for now these check that the safety pattern is actually present in
-// the source, which is weaker than a real unit test but still catches an
-// accidental revert of either fix.
+console.log("\nStructural checks — content.js safety patterns still bound to its closure (see note on why these remain source-pattern checks)");
+// Most of the JSON-LD scoring/identity logic and the claim-proximity
+// calculation were extracted into shared.js specifically so they could be
+// exercised with real behavioral tests instead of these (see above) — but
+// a few things still need live DOM/browser globals content.js owns
+// (findClaimedWasPrice's anchor requirement, the Shadow DOM badge
+// rendering) and remain checked this weaker way for now.
 const contentSrc = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
 
-test("JSON-LD detection rejects multi-candidate pages with zero identity match", () => {
-  assert(
-    /viableCandidateCount > 1 && bestTitleMatch === 0/.test(contentSrc),
-    "the identity-floor guard appears to have been removed from detectFromJsonLd()"
-  );
-});
 test("findClaimedWasPrice requires an anchor element (no whole-document fallback)", () => {
   assert(
     /function findClaimedWasPrice\(anchorEl\)/.test(contentSrc) && /if \(!anchorEl\) return null;/.test(contentSrc),
@@ -265,25 +271,131 @@ test("the badge host element never receives a verdict-dependent class (Shadow DO
   assert(/host\.attachShadow\(\{\s*mode:\s*"closed"\s*\}\)/.test(contentSrc), "badge no longer uses a closed shadow root");
 });
 
-console.log("\nStructural checks — JSON-LD candidate confidence (4th adversarial review round)");
-test("JSON-LD detection rejects tied candidates that disagree on price", () => {
-  assert(
-    /candidatesAtBestScore\.length > 1/.test(contentSrc) && /distinctPrices\.size > 1/.test(contentSrc),
-    "the tied-candidate ambiguity guard appears to have been removed — two equal-scoring variants with different prices could be arbitrarily resolved to whichever was scanned first"
+console.log("\nselectBestJsonLdCandidate — behavioral tests (real function calls, not source patterns)");
+test("a single unrelated Product on a homepage is not auto-accepted by identity alone (still flags zero title match)", () => {
+  // selectBestJsonLdCandidate() only owns the identity/scoring decision —
+  // it correctly returns a result here (nothing else to compare against),
+  // but flags bestTitleMatch: 0 so the caller (content.js) knows this
+  // needs independent corroboration before trusting it. That corroboration
+  // step itself needs live DOM access (og:type, visible price scanning)
+  // and is checked structurally below, since it can't be exercised without
+  // a full browser-like page.
+  const result = selectBestJsonLdCandidate(
+    [{ name: "Unrelated Featured Toaster", priceInfo: { price: 29.95, currency: "AUD", isExact: true }, sku: "TOASTER-1" }],
+    "Blue Widget"
   );
+  assert(result !== null, "a lone candidate should still be returned with its match quality flagged");
+  assert.strictEqual(result.bestTitleMatch, 0, "zero title correspondence should be reported, not silently ignored");
 });
-test("a single zero-identity JSON-LD candidate requires independent corroboration", () => {
-  assert(
-    /pageDeclaresProductType\(\)/.test(contentSrc) && /hasVisiblePriceCorroboration\(/.test(contentSrc),
-    "single-candidate corroboration requirement appears to have been removed — an unrelated Product on a non-product page could be accepted with no supporting evidence at all"
+test("multiple candidates with zero identity correspondence are rejected outright", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Beach Towel", priceInfo: { price: 15, currency: "AUD", isExact: true } },
+      { name: "Sunscreen SPF50", priceInfo: { price: 22, currency: "AUD", isExact: true } },
+      { name: "Flip Flops", priceInfo: { price: 18, currency: "AUD", isExact: true } },
+    ],
+    "Summer Sale"
   );
+  assert.strictEqual(result, null, "a listing page with several unrelated products and no title match should reject detection entirely");
+});
+test("identity correspondence outranks an unrelated exact price (scoring inversion regression)", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Sony WH-1000XM5 Headphones", priceInfo: { price: 349, currency: "AUD", isExact: false } },
+      { name: "Random USB Cable", priceInfo: { price: 12, currency: "AUD", isExact: true } },
+    ],
+    "Sony WH-1000XM5 Headphones"
+  );
+  assert(result !== null && result.candidate.name === "Sony WH-1000XM5 Headphones", "the matching-title candidate should win despite the unrelated item having an exact price");
+});
+test("tied candidates that disagree on price are rejected (Red $10 / Blue $20)", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Widget", priceInfo: { price: 10, currency: "AUD", isExact: true }, sku: "RED" },
+      { name: "Widget", priceInfo: { price: 20, currency: "AUD", isExact: true }, sku: "BLUE" },
+    ],
+    "Widget"
+  );
+  assert.strictEqual(result, null, "two equally-scoring variants with different prices must not be arbitrarily resolved");
+});
+test("tied candidates with the SAME price but different SKUs are still rejected (5th round: equal price != equal product)", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Widget", priceInfo: { price: 10, currency: "AUD", isExact: true }, sku: "RED" },
+      { name: "Widget", priceInfo: { price: 10, currency: "AUD", isExact: true }, sku: "BLUE" },
+    ],
+    "Widget"
+  );
+  assert.strictEqual(result, null, "matching price alone doesn't mean matching identity — different SKUs at the same price are still a real conflict, not a safe duplicate");
+});
+test("tied candidates in different currencies at the same numeric price are rejected (AUD 100 vs USD 100)", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Item", priceInfo: { price: 100, currency: "AUD", isExact: true } },
+      { name: "Item", priceInfo: { price: 100, currency: "USD", isExact: true } },
+    ],
+    "Item"
+  );
+  assert.strictEqual(result, null, "100 AUD and 100 USD are not equivalent evidence just because the numbers match");
+});
+test("three-decimal currency prices are NOT collapsed by the tie-identity check (KWD 1.250 vs 1.251)", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Item", priceInfo: { price: 1.25, currency: "KWD", isExact: true } },
+      { name: "Item", priceInfo: { price: 1.251, currency: "KWD", isExact: true } },
+    ],
+    "Item"
+  );
+  assert.strictEqual(result, null, "1.250 and 1.251 KWD are genuinely different prices and must be treated as a real conflict, not rounded together");
+});
+test("genuine duplicate candidates (identical in every way) are still accepted — no real ambiguity", () => {
+  const result = selectBestJsonLdCandidate(
+    [
+      { name: "Widget", priceInfo: { price: 19.99, currency: "AUD", isExact: true } },
+      { name: "Widget", priceInfo: { price: 19.99, currency: "AUD", isExact: true } },
+    ],
+    "Widget"
+  );
+  assert(result !== null, "identical duplicate JSON-LD entries (same name, price, currency) should still be accepted");
 });
 
-console.log("\nStructural checks — ambiguity-aware claim scoping (4th adversarial review round)");
-test("findLocalContainer stops at unrelated sibling sections rather than climbing a fixed depth", () => {
+console.log("\nproximityHops — behavioral tests against real DOM fixtures (jsdom)");
+test("an unrelated sibling section's claim is rejected even when generically named (5th round: <aside class='promo'>)", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><main><div id="product"><span class="price">$50</span></div><aside class="promo"><del>$100</del></aside></main></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const del = doc.querySelector("del");
+  const dist = proximityHops(anchor, del);
+  assert(dist > 3, `expected the unrelated aside's claim to be far (>3 hops), got ${dist}`);
+});
+test("a genuinely co-located claim (direct sibling) is close enough to accept", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><div id="main-product"><span class="price">$50</span><del>$100</del></div></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const del = doc.querySelector("del");
+  const dist = proximityHops(anchor, del);
+  assert(dist <= 3, `expected the co-located claim to be close (<=3 hops), got ${dist}`);
+});
+test("a realistic nested price-container pattern (price and was-price each in their own wrapper) still passes", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><div id="product-details"><div class="price-container"><div class="price">$50</div><div class="was-price">$100</div></div></div></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const wasEl = doc.querySelector(".was-price");
+  const dist = proximityHops(anchor, wasEl);
+  assert(dist <= 3, `expected the nested-wrapper claim to still be close enough (<=3 hops), got ${dist}`);
+});
+
+console.log("\nStructural checks — content.js-specific corroboration logic (needs live DOM access, can't be exercised with plain data)");
+test("single zero-identity JSON-LD candidates require BOTH og:type=product AND a matching visible price, not either alone", () => {
   assert(
-    /looksLikeUnrelatedSection/.test(contentSrc) && /countPriceSignals/.test(contentSrc),
-    "the ambiguity-aware container scoping appears to have reverted to a fixed-depth walk, which the 4th review round showed could still sweep in an unrelated recommendations section"
+    /pageDeclaresProductType\(\)\s*&&\s*hasVisiblePriceCorroboration\(/.test(contentSrc),
+    "the corroboration check should use && (both required) — an earlier version used || (either alone was accepted), which let og:type=product alone rescue a completely unrelated stale candidate"
   );
 });
 test("price and claim detection both check element visibility", () => {

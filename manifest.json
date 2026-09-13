@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Price Ledger — Universal Price Historian",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "description": "Tracks price history locally, flags fake sales against your own data, and alerts on new lows.",
   "permissions": ["storage", "notifications"],
   "background": {

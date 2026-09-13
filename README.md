@@ -410,3 +410,79 @@ the wrong product. Also verified by reproduction before fixing.
   only for things like cross-origin `fetch()` from extension pages or
   dynamic script injection, neither of which this extension does.
 - **The test suite grew to 63 checks.**
+
+### Fifth hardening pass
+
+A fifth adversarial review found that the previous round's two JSON-LD
+fixes and the claim-scoping fix were each real improvements but still
+incomplete — and made a specific, repeated point worth taking seriously:
+source-pattern tests (checking that certain code exists) can't actually
+prove detection behaves correctly, only that it looks like it should.
+This round's response includes an actual architectural change in
+response to that, not just another patch.
+
+- **`og:type=product` alone isn't corroboration.** The previous round
+  required *either* the page declaring itself a product page *or* a
+  visible matching price to accept a lone zero-identity JSON-LD
+  candidate — but og:type=product only establishes "this page is about
+  some product," not "this specific stale candidate is that product." A
+  page showing a $99 Blue Widget with a stale, unrelated $29.95 Toaster
+  in its JSON-LD would still accept the Toaster, since og:type=product
+  was present. Changed to require both conditions together, and also
+  narrowed the visible-price check itself to compare against the page's
+  own primary displayed price specifically, not any incidental price
+  match anywhere on the page (a coincidentally same-priced recommended
+  item elsewhere could otherwise corroborate something unrelated).
+- **Tied candidates were only compared on price, rounded to 2 decimals.**
+  Two different variants (Red $10 / Blue $10) that simply cost the same
+  today aren't the same product, but agreeing on price alone let one get
+  picked arbitrarily — a corruption that stays invisible until the two
+  variants' prices later diverge. Currency was also ignored entirely
+  (AUD 100 and USD 100 counted as "the same"), and rounding to 2 decimals
+  collapsed genuinely different three-decimal-currency prices (KWD 1.250
+  vs 1.251) into equal. Tie-breaking now compares full identity —
+  normalized name, currency, any available SKU/GTIN/MPN, and price to 6
+  decimal places — rejecting the whole detection if tied candidates
+  disagree on any of it.
+- **Claim scoping still leaked through generically-named sections.** The
+  previous round's container-boundary heuristics (named-sibling
+  detection, price-signal counting) both failed on an ordinary
+  `<aside class="promo">` — a real name a real site would plausibly use,
+  matching neither the unrelated-section keyword list nor tripping the
+  signal-count threshold. Replaced the core safety mechanism entirely:
+  instead of trying to define the "right" container and search freely
+  within it, claim detection now measures actual DOM hop-distance between
+  the current-price element and any candidate claim, keeping only the
+  closest one within a conservative threshold. This deliberately trades
+  recall for precision, per the reviewer's own stated preference for this
+  specific feature — an occasional missed claim from unusually deep
+  markup nesting is a far smaller problem than attributing an unrelated
+  claim to the wrong product and judging it against that product's
+  history.
+- **The JSON-LD candidate-selection logic was extracted into `shared.js`**
+  as `selectBestJsonLdCandidate()` and `titleSimilarity()`, and the claim
+  proximity calculation as `proximityHops()` — directly responding to the
+  repeated critique that this logic, buried in content.js's closure,
+  could only be checked by looking for the right code pattern rather than
+  actually exercised. `content.js` still owns everything that needs live
+  DOM access (parsing JSON-LD script tags, checking og:type, scanning for
+  a visible corroborating price); the pure decision logic, once that data
+  is collected, now lives somewhere genuinely testable with plain data
+  and DOM fixtures.
+- **The test suite now includes real behavioral tests**, not just source
+  patterns: `selectBestJsonLdCandidate()` is exercised directly against
+  every scenario from this round and the previous one (unrelated
+  candidates, tied variants, cross-currency ties, three-decimal-currency
+  ties, genuine duplicates), and `proximityHops()` is tested against real
+  jsdom DOM fixtures reproducing the exact `<aside class="promo">` case
+  alongside legitimate co-located and realistically-nested claims. This
+  needed `jsdom` as an actual dev dependency — run `npm install` in this
+  directory once before `node test/run-tests.js` (or `npm test`); it's
+  dev-only and never shipped as part of the extension itself. A few
+  things that still need live browser globals (the corroboration
+  AND-logic, the Shadow DOM badge rendering) remain checked by weaker
+  source-pattern tests for now, noted honestly in the test file itself.
+- **Fixed a stale comment** in `inferCurrencyFromDomain()` that described
+  the exact opposite of what the code actually does (a leftover from
+  before the null-currency fix two rounds ago).
+- **The test suite grew to 71 checks.**

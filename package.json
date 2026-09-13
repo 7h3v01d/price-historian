@@ -1,0 +1,11 @@
+{
+  "name": "price-ledger-tests",
+  "private": true,
+  "description": "Dev dependencies for the test suite only — not part of the shipped extension.",
+  "devDependencies": {
+    "jsdom": "^24.0.0"
+  },
+  "scripts": {
+    "test": "node test/run-tests.js"
+  }
+}

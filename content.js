@@ -51,9 +51,10 @@
     // structured currency metadata at all; guessing USD would mislabel
     // real evidence rather than honestly recording that we don't know.
     // fmt() and filterSameCurrency() both handle a null currency
-    // correctly (displaying "(currency unknown)" instead of a wrong
-    // label, and still grouping same-unknown-currency observations
-    // together for comparison purposes).
+    // correctly: fmt() displays "(currency unknown)" instead of a wrong
+    // label, and filterSameCurrency() treats null as never comparable to
+    // anything — including another null — rather than grouping unknown
+    // observations together as if "unknown" were itself a real currency.
     return null;
   }
 
@@ -107,18 +108,9 @@
     return null;
   }
 
-  // A rough, deliberately simple similarity check — not fuzzy-matching
-  // for its own sake, just enough to tell "this Product's name is
-  // basically the page's title" from "this is some unrelated Product
-  // object that happened to be on the page" (e.g. a related-items widget).
-  function titleSimilarity(candidateName, pageTitle) {
-    if (!candidateName || !pageTitle) return 0;
-    const a = candidateName.toLowerCase().trim();
-    const b = pageTitle.toLowerCase().trim();
-    if (!a || !b) return 0;
-    if (a === b) return 1;
-    return a.includes(b) || b.includes(a) ? 0.5 : 0;
-  }
+  // titleSimilarity(), normalize(), and selectBestJsonLdCandidate() come
+  // from shared.js — extracted there so the core candidate-selection
+  // logic can be tested directly with plain data.
 
   // A page declaring og:type=product is independent corroboration that
   // this page is actually about one specific product — useful when a
@@ -134,83 +126,71 @@
   // shown on the page — a stale or unrelated structured-data block
   // wouldn't have anything visible backing it up.
   function hasVisiblePriceCorroboration(price) {
-    for (const el of findPriceElements()) {
-      const num = extractPriceFromText(el.textContent);
-      if (num != null && Math.abs(num - price) < 0.01) return true;
-    }
-    return false;
+    // Checks specifically against the page's own primary displayed
+    // price (the same one the DOM-fallback detector would pick as THE
+    // price), not "any price anywhere on the page." Checking against any
+    // match was too permissive — a coincidentally same-priced recommended
+    // item elsewhere on the page could corroborate a completely unrelated
+    // stale JSON-LD candidate just by chance.
+    const featured = pickBestPriceElement(findPriceElements());
+    if (!featured) return false;
+    const num = extractPriceFromText(featured.textContent);
+    return num != null && Math.abs(num - price) < 0.01;
   }
 
   function detectFromJsonLd() {
     const products = parseJsonLdProducts();
     const pageTitle = document.querySelector('meta[property="og:title"]')?.content || document.title || "";
 
+    // Build plain candidate objects (name + priceInfo + any identifiers)
+    // for every Product with a usable offer, then delegate the actual
+    // selection — scoring, identity floor, tied-candidate resolution —
+    // to the shared, independently-testable selectBestJsonLdCandidate().
     // A page can embed multiple Product objects (variants, related items,
-    // a whole listing's worth of JSON-LD). Taking "the first one with any
-    // usable offer" risked picking the wrong one entirely. Score every
-    // candidate instead and take the best.
-    //
-    // Identity correspondence dominates price-quality, not the other way
-    // around: a candidate whose name actually matches the page (weight
-    // ×10) always outranks an unrelated candidate that merely has an
-    // exact price (+2) rather than a range floor (+0) — an earlier
-    // version weighted these the other way and could pick a completely
-    // unrelated recommended-item's exact price over the actual product's
-    // range-floor price, which is a worse failure than the one this
-    // scoring was originally built to prevent.
-    //
-    // But weighting alone doesn't help when EVERY candidate has zero
-    // identity correspondence — e.g. a listing/category page with several
-    // Product objects, none of which match the page's own title. In that
-    // case "pick whichever scores highest" just means "pick the first one
-    // that ties," which is confidently recording a coin-flip.
-    let best = null;
-    let bestScore = -Infinity;
-    let bestTitleMatch = 0;
-    let viableCandidateCount = 0;
-    let candidatesAtBestScore = [];
+    // a whole listing's worth of JSON-LD); "the first one with any usable
+    // offer" risked picking the wrong one entirely.
+    const candidates = [];
     for (const p of products) {
       const priceInfo = extractOfferPrice(p.offers);
       if (!priceInfo) continue;
-      viableCandidateCount++;
-      const titleMatch = titleSimilarity(p.name, pageTitle);
-      const score = titleMatch * 10 + (priceInfo.isExact ? 2 : 0);
-      if (score > bestScore) {
-        bestScore = score;
-        bestTitleMatch = titleMatch;
-        best = { p, priceInfo };
-        candidatesAtBestScore = [{ p, priceInfo }];
-      } else if (score === bestScore) {
-        candidatesAtBestScore.push({ p, priceInfo });
-      }
+      candidates.push({
+        name: p.name,
+        priceInfo,
+        gtin13: p.gtin13,
+        gtin: p.gtin,
+        gtin12: p.gtin12,
+        gtin8: p.gtin8,
+        mpn: p.mpn,
+        sku: p.sku,
+        _raw: p,
+      });
     }
-    if (!best) return null;
-    if (viableCandidateCount > 1 && bestTitleMatch === 0) return null;
 
-    // Two (or more) candidates tying on score is only safe to resolve by
-    // picking one if they actually agree on price — e.g. the same product
-    // duplicated in JSON-LD. If they disagree (the classic case: two
-    // color/size variants both named "Widget," each with its own exact
-    // price), picking whichever happened to be scanned first is a coin
-    // flip that could record the wrong variant as a fictional new low.
-    if (candidatesAtBestScore.length > 1) {
-      const distinctPrices = new Set(candidatesAtBestScore.map((c) => c.priceInfo.price.toFixed(2)));
-      if (distinctPrices.size > 1) return null;
-    }
+    const selection = selectBestJsonLdCandidate(candidates, pageTitle);
+    if (!selection) return null;
+    const { candidate, bestTitleMatch, viableCandidateCount } = selection;
 
     // A single candidate with zero title correspondence is still
     // ambiguous on its own — it could be a stale or unrelated Product
     // object on a homepage, editorial page, or promo banner that happens
-    // to have no competing candidates to lose to. Require independent
-    // corroboration before trusting it: either the page declares itself a
-    // product page, or there's a visible price on the page that actually
-    // matches the JSON-LD price.
+    // to have no competing candidates to lose to. Require BOTH the page
+    // declaring itself a product page AND a visible price actually
+    // matching this specific candidate — not either alone. og:type=product
+    // only establishes "this page is about some product," not "this
+    // particular zero-identity JSON-LD object is that product": a stale
+    // Toaster object with no title match could otherwise ride along on a
+    // legitimate Blue Widget product page just because *a* product page
+    // declaration exists somewhere, with nothing tying the $29.95 figure
+    // to what's actually shown. This check needs live DOM access
+    // (og:type, visible price scanning), so it stays here rather than in
+    // the shared pure-data selector.
     if (viableCandidateCount === 1 && bestTitleMatch === 0) {
-      const corroborated = pageDeclaresProductType() || hasVisiblePriceCorroboration(best.priceInfo.price);
+      const corroborated = pageDeclaresProductType() && hasVisiblePriceCorroboration(candidate.priceInfo.price);
       if (!corroborated) return null;
     }
 
-    const { p, priceInfo } = best;
+    const p = candidate._raw;
+    const priceInfo = candidate.priceInfo;
     const rawId = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
     return {
       title: (p.name || document.title || "").trim().slice(0, 140),
@@ -236,13 +216,7 @@
     return image.url || null;
   }
 
-  function normalize(str) {
-    return (str || "")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 80);
-  }
+  // normalize() comes from shared.js.
 
   // Page-controlled SKU/GTIN/MPN values (used to build the "id:" storage
   // key variant) had no equivalent bound — normalize() above caps the
@@ -391,15 +365,16 @@
   }
 
   // Walks up from a price element toward a container that plausibly
-  // represents "this product's own block," stopping as soon as expanding
-  // further shows real evidence of ambiguity — a sibling subtree named
-  // like a different section, or the total price-signal count growing
-  // beyond what one product's own current+was price pair would produce —
-  // rather than climbing a fixed number of levels regardless of what's
-  // actually there. A fixed-depth walk previously stopped at whatever
-  // ancestor happened to be N levels up (often <main> or similar in
-  // ordinary markup), which could still contain an entire unrelated
-  // recommendations section as a sibling.
+  // represents "this product's own block." Kept as a coarse OUTER bound —
+  // it still avoids scanning an entire huge page — but is no longer the
+  // primary safety mechanism. It was found to still admit an unrelated
+  // sibling in perfectly ordinary markup (a generically-named `<aside
+  // class="promo">` isn't caught by any class-name pattern, and a page
+  // with exactly one current price and one unrelated comparison price
+  // elsewhere numerically looks identical to one product's own current+
+  // was pair under a pure signal-count check). The real gate is now
+  // proximityHops() below, which measures actual DOM distance rather than
+  // guessing from naming conventions or counts.
   function findLocalContainer(el, maxLevels = 8) {
     let node = el;
     for (let i = 0; i < maxLevels; i++) {
@@ -418,43 +393,53 @@
     return node;
   }
 
+  // proximityHops() comes from shared.js.
+
+  // Maximum combined hop-distance allowed between the current-price
+  // anchor and a candidate claim before it's rejected as too far to
+  // trust. Deliberately tight: a real product's price and its own "was"
+  // price are typically siblings or near-siblings sharing a small direct
+  // wrapper (combined distance 2-3). This threshold intentionally trades
+  // recall for precision — missing an occasional legitimate claim that
+  // happens to sit behind extra wrapper elements is a far smaller problem
+  // than attributing a stale or unrelated claim to the wrong product and
+  // judging it against that product's history.
+  const MAX_CLAIM_PROXIMITY = 3;
+
   // Captures the figure the retailer wants you to compare against — a
   // struck-through "was $X", an RRP, or a "compare at" price — so it can
   // be checked against what THIS browser has actually observed, rather
   // than trusted at face value.
   //
-  // Requires an anchor element (the actual current-price DOM node) and
-  // searches only its local neighborhood, not the whole document.
-  // Searching the whole page previously meant an unrelated "was $100" on
-  // a completely different recommended-item widget could get attributed
-  // to the actual product being tracked — Price Historian would then
-  // judge that claim against history for an item that never made it.
-  // Callers with no DOM element to anchor to (JSON-LD or meta-tag-only
-  // detection, where the price comes from structured data rather than a
-  // visible element) don't attempt claim detection at all rather than
-  // guessing across the whole page.
+  // Requires an anchor element (the actual current-price DOM node).
+  // Candidates are found within a coarse local container (see
+  // findLocalContainer) but only accepted if they also pass the
+  // proximity check above — of everything found, the single closest
+  // candidate to the anchor is used, and only if its distance is within
+  // MAX_CLAIM_PROXIMITY. Callers with no DOM element to anchor to
+  // (JSON-LD or meta-tag-only detection, where the price comes from
+  // structured data rather than a visible element) don't attempt claim
+  // detection at all rather than guessing across the whole page.
   function findClaimedWasPrice(anchorEl) {
     if (!anchorEl) return null;
     const scopeRoot = findLocalContainer(anchorEl);
 
-    // Prefer genuine <del>/<s>/<strike> markup first — that's an explicit,
-    // unambiguous semantic signal a page can't casually get wrong.
-    const strikeEls = scopeRoot.querySelectorAll("del, s, strike");
-    for (const el of strikeEls) {
-      if (!isVisible(el)) continue;
-      const text = el.textContent.trim();
-      if (text.length >= 24) continue;
-      const price = extractPriceFromText(text);
-      if (price != null) return price;
-    }
+    // Prefer genuine <del>/<s>/<strike> markup — an explicit, unambiguous
+    // semantic signal — but score every candidate (from both signal
+    // types) by proximity together, so the truly closest one wins
+    // regardless of which detection method found it.
+    const strikeCandidates = Array.from(scopeRoot.querySelectorAll("del, s, strike"));
+    const classCandidates = Array.from(
+      scopeRoot.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]')
+    ).filter((el) => /was|rrp|strike|compare-?at/.test(`${el.className} ${el.id}`.toLowerCase()));
 
-    // Fall back to the same class/id keyword heuristic used to exclude
-    // these from the current-price detector — same signal, opposite intent.
-    const nodes = scopeRoot.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
-    for (const el of nodes) {
-      if (!isVisible(el)) continue;
-      const flag = `${el.className} ${el.id}`.toLowerCase();
-      if (!/was|rrp|strike|compare-?at/.test(flag)) continue;
+    const scored = [...strikeCandidates, ...classCandidates]
+      .filter(isVisible)
+      .map((el) => ({ el, dist: proximityHops(anchorEl, el) }))
+      .filter((c) => c.dist <= MAX_CLAIM_PROXIMITY)
+      .sort((a, b) => a.dist - b.dist);
+
+    for (const { el } of scored) {
       const text = el.textContent.trim();
       if (text.length >= 24) continue;
       const price = extractPriceFromText(text);

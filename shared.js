@@ -3,6 +3,123 @@
 // popup.js/history.js (as a plain <script> tag) so all three can use these
 // without three copy-pasted definitions drifting out of sync.
 
+// ---------- Product identity (JSON-LD candidate selection) ----------
+// Extracted from content.js so this logic — where three consecutive
+// rounds of adversarial review found real bugs (scoring weight inversion,
+// missing identity floor, tied-candidate ambiguity) — can be exercised
+// directly with plain test data, rather than only checked by looking for
+// the right regex pattern in content.js's source. content.js still owns
+// everything that needs live DOM access (extracting offers from actual
+// JSON-LD script tags, checking og:type, scanning for a visible
+// corroborating price); this owns the pure decision once that data is
+// already collected.
+
+function normalize(str) {
+  return (str || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+// A rough, deliberately simple similarity check — not fuzzy-matching for
+// its own sake, just enough to tell "this candidate's name is basically
+// the page's title" from "this is some unrelated object that happened to
+// be on the page."
+function titleSimilarity(candidateName, pageTitle) {
+  if (!candidateName || !pageTitle) return 0;
+  const a = candidateName.toLowerCase().trim();
+  const b = pageTitle.toLowerCase().trim();
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  return a.includes(b) || b.includes(a) ? 0.5 : 0;
+}
+
+// Selects the best candidate from a list of { name, priceInfo: { price,
+// currency, isExact }, gtin13?, gtin?, gtin12?, gtin8?, mpn?, sku? }
+// objects, or returns null if none is trustworthy enough to accept.
+//
+// Identity correspondence dominates price-quality: a candidate whose name
+// actually matches the page (weight ×10) always outranks one that merely
+// has an exact price (+2) rather than a range floor (+0) — weighting
+// these the other way around let an unrelated recommended-item's exact
+// price outrank the actual product's own range-floor price.
+//
+// Multiple candidates with zero identity correspondence at all reject
+// the whole detection — picking one is a coin flip, not a decision.
+//
+// Candidates that TIE on score are only resolved by picking one if they
+// fully agree on identity: normalized name, currency, any available
+// SKU/GTIN/MPN, and price to 6 decimal places (not 2 — rounding to 2
+// decimals collapsed genuinely different three-decimal-currency prices,
+// e.g. KWD 1.250 vs 1.251, into the same value). Two different variants
+// that simply cost the same today are NOT the same product, and picking
+// one arbitrarily would silently record the wrong SKU's identity.
+//
+// A single candidate with zero identity match is returned with
+// bestTitleMatch: 0 in the result — content.js decides separately whether
+// that's acceptable (it isn't, on its own; see the corroboration
+// requirement there) since that decision needs live DOM access this
+// function doesn't have.
+function selectBestJsonLdCandidate(candidates, pageTitle) {
+  let best = null;
+  let bestScore = -Infinity;
+  let bestTitleMatch = 0;
+  let candidatesAtBestScore = [];
+
+  for (const c of candidates) {
+    const titleMatch = titleSimilarity(c.name, pageTitle);
+    const score = titleMatch * 10 + (c.priceInfo.isExact ? 2 : 0);
+    if (score > bestScore) {
+      bestScore = score;
+      bestTitleMatch = titleMatch;
+      best = c;
+      candidatesAtBestScore = [c];
+    } else if (score === bestScore) {
+      candidatesAtBestScore.push(c);
+    }
+  }
+  if (!best) return null;
+  if (candidates.length > 1 && bestTitleMatch === 0) return null;
+
+  if (candidatesAtBestScore.length > 1) {
+    const identityKey = (c) => {
+      const rawId = c.gtin13 || c.gtin || c.gtin12 || c.gtin8 || c.mpn || c.sku || "";
+      return [normalize(c.name || ""), c.priceInfo.currency || "", rawId, c.priceInfo.price.toFixed(6)].join("|");
+    };
+    const distinctIdentities = new Set(candidatesAtBestScore.map(identityKey));
+    if (distinctIdentities.size > 1) return null;
+  }
+
+  return { candidate: best, bestTitleMatch, viableCandidateCount: candidates.length };
+}
+
+// ---------- Claim proximity ----------
+// Combined hop-distance from `el` up to its nearest ancestor shared with
+// `anchorEl`, plus the anchor's own hop-distance to that same ancestor.
+// Elements that are siblings (or near-siblings) within the same small
+// wrapper score low; elements that only share something as high up as
+// <main> — e.g. a product's price and an unrelated promo section's price
+// — score high, regardless of what either element or its container
+// happens to be named. This is what actually distinguishes "this
+// product's own was-price" from "some other content's price that happens
+// to be nearby in the markup," which naming conventions and raw element
+// counts both proved unable to do reliably on their own. Needs real DOM
+// elements (walks .parentElement), but has no other dependency on
+// content.js's closure, so it's kept here where it can be tested directly
+// against DOM fixtures.
+function proximityHops(anchorEl, el) {
+  const anchorChain = [];
+  for (let node = anchorEl; node; node = node.parentElement) anchorChain.push(node);
+
+  let hopsUp = 0;
+  for (let node = el; node; node = node.parentElement, hopsUp++) {
+    const idx = anchorChain.indexOf(node);
+    if (idx !== -1) return hopsUp + idx;
+  }
+  return Infinity;
+}
+
 // fmt() is intrinsically safe against untrusted currency strings — it
 // sanitizes internally rather than trusting callers to have done it
 // already. This matters even though every known page-controlled ingestion
