@@ -250,6 +250,31 @@ function renderChart(product) {
   const main = document.getElementById("main");
   const history = product.history;
   const last = history[history.length - 1];
+
+  if (last.c == null) {
+    // No comparable history exists or ever could for an unknown currency
+    // — filterSameCurrency() correctly returns nothing here rather than
+    // fabricating a comparison, but that means there's no valid dataset
+    // to build a chart or low/high stats from. Say so plainly instead of
+    // Math.min() on an empty array quietly producing Infinity/NaN.
+    main.innerHTML = `
+      <div class="pl-header-row">
+        <div>
+          <h2 class="pl-product-title">${escapeHtml(product.meta.title || "Untitled product")}</h2>
+          <div class="pl-product-domain">${escapeHtml(product.domain)} · <a href="${escapeHtml(product.meta.url)}" target="_blank" rel="noopener">open product page ↗</a></div>
+        </div>
+      </div>
+      <div class="pl-stat-row">
+        <div class="pl-stat">
+          <span class="pl-stat-label">Current</span>
+          <span class="pl-stat-value">${fmt(last.p, null)}</span>
+        </div>
+      </div>
+      <p class="pl-placeholder">Currency unknown for this site — historical comparison isn't available for this product.</p>
+    `;
+    return;
+  }
+
   // Display (chart + stat cards) is filtered to the current currency —
   // mixing currencies on one axis would plot numbers as if they were
   // comparable when they aren't. Claim evaluation below still uses the
@@ -489,16 +514,29 @@ function buildBarChartSvg(buckets, currency) {
 // sites), and summing across those would silently produce a meaningless
 // total rather than an error — grouping instead of summing raw numbers
 // keeps every total honest.
+//
+// Products with a genuinely unknown (null) currency are excluded
+// entirely, not grouped under a "null" bucket — filterSameCurrency()
+// correctly returns an empty history for them (nothing is comparable to
+// an unknown currency, not even another unknown), and an empty history
+// can't be summed or averaged into anything meaningful. Returns the
+// grouped products plus a count of how many were excluded, so the caller
+// can say so rather than silently dropping them.
 function groupProductsByCurrency(products) {
   const groups = new Map();
+  let unknownCurrencyCount = 0;
   for (const product of products) {
     const lastCurrency = product.history[product.history.length - 1].c;
+    if (lastCurrency == null) {
+      unknownCurrencyCount++;
+      continue;
+    }
     const cleanHistory = filterSameCurrency(product.history, lastCurrency);
     const cleanProduct = { ...product, history: cleanHistory };
     if (!groups.has(lastCurrency)) groups.set(lastCurrency, []);
     groups.get(lastCurrency).push(cleanProduct);
   }
-  return groups;
+  return { groups, unknownCurrencyCount };
 }
 
 function renderSummary(products, period) {
@@ -509,17 +547,32 @@ function renderSummary(products, period) {
     return;
   }
 
-  const groups = groupProductsByCurrency(products);
+  const { groups, unknownCurrencyCount } = groupProductsByCurrency(products);
   const currencyList = Array.from(groups.keys());
+
+  if (!currencyList.length) {
+    main.innerHTML = `<p class="pl-placeholder">Currency unknown for everything tracked so far — nothing here can be totaled yet.</p>`;
+    return;
+  }
+
+  const notes = [];
+  if (currencyList.length > 1) {
+    notes.push(
+      `Tracked items span ${currencyList.length} currencies (${currencyList.join(", ")}) — shown as separate totals below rather than mixed into one number.`
+    );
+  }
+  if (unknownCurrencyCount > 0) {
+    notes.push(
+      `${unknownCurrencyCount} item(s) excluded — currency unknown for those sites, so they can't be totaled with anything.`
+    );
+  }
 
   main.innerHTML = `
     <div class="pl-header-row">
       <div>
         <h2 class="pl-product-title">Spend summary</h2>
         <div class="pl-product-domain">Based on prices you've actually observed — not purchase data.${
-          currencyList.length > 1
-            ? ` Tracked items span ${currencyList.length} currencies (${currencyList.join(", ")}) — shown as separate totals below rather than mixed into one number.`
-            : ""
+          notes.length ? " " + notes.join(" ") : ""
         }</div>
       </div>
     </div>
@@ -688,7 +741,10 @@ function renderComparison(group, products) {
     const last = m.history[m.history.length - 1];
     // Each retailer's own low is computed within its own currency too —
     // the same currency-mixing risk applies within a single member's
-    // history, not just across members.
+    // history, not just across members. An unknown currency has no
+    // comparable history by definition (filterSameCurrency correctly
+    // returns nothing), so `low` is null rather than a Math.min() over
+    // an empty array silently becoming Infinity.
     const ownHistorySameCurrency = filterSameCurrency(m.history, last.c);
     return {
       domain: m.domain,
@@ -696,18 +752,24 @@ function renderComparison(group, products) {
       url: m.meta.url,
       price: last.p,
       currency: last.c,
-      low: Math.min(...ownHistorySameCurrency.map((h) => h.p)),
+      low: ownHistorySameCurrency.length ? Math.min(...ownHistorySameCurrency.map((h) => h.p)) : null,
     };
   });
 
   // Ranking "cheapest" by raw number only makes sense if every retailer is
-  // actually priced in the same currency. Linking a comparison across
-  // countries/currencies is an edge case, but silently ranking $70 USD
-  // below $100 AUD as "cheaper" without conversion would be actively
+  // actually priced in the same KNOWN currency. Linking a comparison
+  // across countries/currencies is an edge case, but silently ranking $70
+  // USD below $100 AUD as "cheaper" without conversion would be actively
   // wrong, not just imprecise — so this disables ranking entirely rather
-  // than pretending the numbers are comparable.
+  // than pretending the numbers are comparable. An unknown currency is
+  // never treated as matching anything, including another unknown — two
+  // members that both happen to have unknown currency are not
+  // "confirmed to be the same currency," they're "confirmed to be
+  // unverifiable," which is exactly why ranking must stay disabled for
+  // them too, not just for a mix of two different known currencies.
   const currencies = new Set(currentByMember.map((m) => m.currency));
-  const mixedCurrencies = currencies.size > 1;
+  const hasUnknownCurrency = currentByMember.some((m) => m.currency == null);
+  const mixedCurrencies = currencies.size > 1 || hasUnknownCurrency;
   const cheapest = mixedCurrencies
     ? null
     : currentByMember.slice().sort((a, b) => a.price - b.price)[0];
@@ -722,7 +784,7 @@ function renderComparison(group, products) {
       <tr>
         <td><span class="pl-legend-swatch" style="background:${COMPARE_PALETTE[members.findIndex((x) => x.domain === m.domain) % COMPARE_PALETTE.length]}"></span>${escapeHtml(m.domain)}</td>
         <td>${fmt(m.price, m.currency)}${!mixedCurrencies && i === 0 ? " · cheapest now" : ""}</td>
-        <td>${fmt(m.low, m.currency)}</td>
+        <td>${m.low != null ? fmt(m.low, m.currency) : "unknown"}</td>
         <td><a href="${escapeHtml(m.url)}" target="_blank" rel="noopener">open ↗</a></td>
       </tr>
     `
@@ -738,7 +800,11 @@ function renderComparison(group, products) {
     </div>
     ${
       mixedCurrencies
-        ? `<div class="pl-claim-note pl-bad">These retailers are priced in different currencies (${Array.from(currencies).join(", ")}) — ranking "cheapest" or overlaying them on one chart would compare numbers that aren't actually equivalent, so that's disabled below. Each retailer's own price and low are still shown individually.</div>`
+        ? `<div class="pl-claim-note pl-bad">These retailers ${
+            hasUnknownCurrency
+              ? `include at least one with an unknown currency (${Array.from(currencies).map((c) => c || "unknown").join(", ")})`
+              : `are priced in different currencies (${Array.from(currencies).join(", ")})`
+          } — ranking "cheapest" or overlaying them on one chart would compare numbers that aren't actually equivalent, so that's disabled below. Each retailer's own price and low are still shown individually.</div>`
         : `<div class="pl-summary-cards">
             <div class="pl-summary-card">
               <div class="pl-summary-card-label">Cheapest right now</div>

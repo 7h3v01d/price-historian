@@ -170,7 +170,165 @@ test("claim evaluation ignores prior observations in a different currency", () =
   assert.strictEqual(result.tone, "neutral");
 });
 
-console.log(`\n${passed} passed, ${failed} failed`);
+console.log("\nfilterSameCurrency / evaluateClaimAt — unknown (null) currency must never match itself");
+test("null currency never matches another null currency", () => {
+  const history = [{ p: 100, c: null, t: 0 }];
+  const filtered = filterSameCurrency(history, null);
+  assert.strictEqual(filtered.length, 0, "two unknown-currency observations must not be treated as comparable");
+});
+test("a null-currency history never produces a fabricated new-low comparison", () => {
+  // The exact scenario from the review: a storefront silently switches
+  // region (A$100 -> currency unavailable -> US$65 -> currency
+  // unavailable), and both unknown-currency readings must never be
+  // compared against each other.
+  const history = [{ p: 100, c: null, t: 0 }];
+  const priorSameCurrency = filterSameCurrency(history, null);
+  assert.strictEqual(priorSameCurrency.length, 0);
+});
+test("a claim on a null-currency observation is reported as unknown, not neutral-first-time", () => {
+  const history = [{ p: 6, c: null, t: 0, w: 12 }];
+  const result = evaluateClaimAt(history, 0);
+  assert.strictEqual(result.tone, "neutral");
+  assert.strictEqual(result.currencyUnknown, true);
+});
+
+console.log("\nparseStructuredPrice — three-decimal currencies (KWD/BHD/OMR/JOD/TND) must not be 1000x corrupted");
+const structuredCases = [
+  ["1.250", 1.25],
+  ["0.750", 0.75],
+  ["12.345", 12.345],
+  ["19.99", 19.99],
+  ["1299.99", 1299.99],
+];
+for (const [input, expected] of structuredCases) {
+  test(`parseStructuredPrice("${input}") === ${expected}, not ${expected * 1000}`, () => {
+    const got = parseStructuredPrice(input);
+    assert(got !== null, `expected ${expected}, got null`);
+    assert(Math.abs(got - expected) < 0.0001, `expected ${expected}, got ${got}`);
+  });
+}
+test("parseStructuredPrice rejects locale-formatted input (that's parsePriceAmount's job, not this one's)", () => {
+  // Structured data is never locale-formatted per spec — a comma here
+  // means the source data is malformed, not that grouping should be
+  // guessed at.
+  assert.strictEqual(parseStructuredPrice("1,299.99"), null);
+});
+
+console.log("\nevaluateClaimAt — evidence requires distinct observation DAYS, not raw observation rows");
+test("four same-day observation rows (e.g. claim edits) do not satisfy the observation-count threshold", () => {
+  const history = [
+    { p: 50, c: "AUD", t: 0, w: null },
+    { p: 50, c: "AUD", t: 1000 * 60 * 20, w: 90 }, // 20 min later, claim appears
+    { p: 50, c: "AUD", t: 1000 * 60 * 40, w: null }, // 40 min later, claim disappears
+    { p: 48, c: "AUD", t: 1000 * 60 * 60, w: null }, // 1hr later, price changes
+    { p: 45, c: "AUD", t: 15 * day, w: 90 }, // day 15, second visit — the point being evaluated
+  ];
+  const result = evaluateClaimAt(history, history.length - 1);
+  // All 4 PRIOR rows fall on the same single calendar day (day 0) — the
+  // point being evaluated (day 15) isn't itself "prior evidence," so
+  // distinctDays counts only what came before it. 4 prior rows, 14-day
+  // span — would have passed the old raw-count check — but only 1
+  // distinct day of actual prior coverage.
+  assert.strictEqual(result.distinctDays, 1);
+  assert.strictEqual(result.tone, "neutral", "1 distinct day of prior coverage is thin evidence regardless of row count");
+});
+
+
+console.log("\nStructural checks — content.js safety patterns (see note below on why these are structural, not unit tests)");
+// titleSimilarity/JSON-LD scoring and findClaimedWasPrice's scoping live
+// inside content.js's IIFE closure, tied to `document`/`location` browser
+// globals — not independently callable from a plain Node test the way
+// shared.js's exported-by-convention functions are. Extracting them to
+// shared.js so they could be unit tested properly is the right long-term
+// fix; for now these check that the safety pattern is actually present in
+// the source, which is weaker than a real unit test but still catches an
+// accidental revert of either fix.
+const contentSrc = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
+
+test("JSON-LD detection rejects multi-candidate pages with zero identity match", () => {
+  assert(
+    /viableCandidateCount > 1 && bestTitleMatch === 0/.test(contentSrc),
+    "the identity-floor guard appears to have been removed from detectFromJsonLd()"
+  );
+});
+test("findClaimedWasPrice requires an anchor element (no whole-document fallback)", () => {
+  assert(
+    /function findClaimedWasPrice\(anchorEl\)/.test(contentSrc) && /if \(!anchorEl\) return null;/.test(contentSrc),
+    "findClaimedWasPrice appears to have lost its required-anchor guard"
+  );
+});
+test("the badge host element never receives a verdict-dependent class (Shadow DOM privacy fix)", () => {
+  assert(
+    !/host\.classList\.add\(stateClass\)/.test(contentSrc),
+    "host.classList.add(stateClass) reappeared — this leaks the verdict via the externally-visible host element"
+  );
+  assert(/host\.attachShadow\(\{\s*mode:\s*"closed"\s*\}\)/.test(contentSrc), "badge no longer uses a closed shadow root");
+});
+
+console.log("\nStructural checks — JSON-LD candidate confidence (4th adversarial review round)");
+test("JSON-LD detection rejects tied candidates that disagree on price", () => {
+  assert(
+    /candidatesAtBestScore\.length > 1/.test(contentSrc) && /distinctPrices\.size > 1/.test(contentSrc),
+    "the tied-candidate ambiguity guard appears to have been removed — two equal-scoring variants with different prices could be arbitrarily resolved to whichever was scanned first"
+  );
+});
+test("a single zero-identity JSON-LD candidate requires independent corroboration", () => {
+  assert(
+    /pageDeclaresProductType\(\)/.test(contentSrc) && /hasVisiblePriceCorroboration\(/.test(contentSrc),
+    "single-candidate corroboration requirement appears to have been removed — an unrelated Product on a non-product page could be accepted with no supporting evidence at all"
+  );
+});
+
+console.log("\nStructural checks — ambiguity-aware claim scoping (4th adversarial review round)");
+test("findLocalContainer stops at unrelated sibling sections rather than climbing a fixed depth", () => {
+  assert(
+    /looksLikeUnrelatedSection/.test(contentSrc) && /countPriceSignals/.test(contentSrc),
+    "the ambiguity-aware container scoping appears to have reverted to a fixed-depth walk, which the 4th review round showed could still sweep in an unrelated recommendations section"
+  );
+});
+test("price and claim detection both check element visibility", () => {
+  assert(/function isVisible\(/.test(contentSrc), "isVisible() appears to have been removed");
+  const findPriceElementsBlock = contentSrc.slice(contentSrc.indexOf("function findPriceElements"), contentSrc.indexOf("function findPriceElements") + 800);
+  assert(/isVisible\(el\)/.test(findPriceElementsBlock), "findPriceElements no longer filters out hidden candidates");
+});
+
+console.log("\nStructural check — storage key length bounding");
+test("page-controlled SKU/GTIN identifiers are bounded before use in a storage key", () => {
+  assert(/function sanitizeIdForKey/.test(contentSrc), "sanitizeIdForKey appears to have been removed — a page could again supply an unbounded identifier into a storage key");
+});
+
+console.log("\nEmpty-array guards — filterSameCurrency([], ...) correctly returning [] must not silently become Infinity/NaN downstream");
+// Fixing the null-currency matching bug (above) means filterSameCurrency
+// can now legitimately return an empty array for a product whose currency
+// is unknown. Math.min()/Math.max() on an empty array silently produces
+// Infinity/-Infinity rather than throwing — several call sites across
+// content.js, history.js, and popup.js assumed a non-empty result and
+// would have shown "Infinity" or crashed on the very first genuinely
+// unknown-currency product. These are structural checks (the actual
+// guards live inside DOM-rendering functions not independently
+// callable here) confirming each site was updated with an explicit
+// length check rather than relying on the old, no-longer-true assumption.
+const historySrc = fs.readFileSync(path.join(__dirname, "..", "history.js"), "utf8");
+const popupSrc = fs.readFileSync(path.join(__dirname, "..", "popup.js"), "utf8");
+
+test("content.js's badge handles unknown currency before computing low/high", () => {
+  assert(/isCurrencyUnknown/.test(contentSrc), "renderBadge should explicitly branch on unknown currency");
+});
+test("history.js's per-product chart handles unknown currency before Math.min/max", () => {
+  assert(/last\.c == null/.test(historySrc), "renderChart should explicitly branch on unknown currency before building chart stats");
+});
+test("history.js's spend summary excludes unknown-currency products rather than crashing on an empty history", () => {
+  assert(/unknownCurrencyCount/.test(historySrc), "groupProductsByCurrency should track and exclude unknown-currency products");
+});
+test("history.js's comparison view guards its own per-member 'low' against an empty same-currency history", () => {
+  assert(
+    /ownHistorySameCurrency\.length \? Math\.min/.test(historySrc),
+    "the comparison view's per-member low calculation should guard against an empty array before calling Math.min"
+  );
+});
+test("popup.js's list handles unknown currency before computing low", () => {
+  assert(/isCurrencyUnknown/.test(popupSrc), "the popup list should explicitly branch on unknown currency");
+});
 
 // ---------- Structural consistency check ----------
 // This is the test that would have actually caught the real regression:
@@ -185,7 +343,7 @@ const consumerFiles = ["content.js", "history.js", "popup.js"];
 const suspiciousPatterns = [
   /observedMax\s*=\s*Math\.max/, // re-deriving the claim's "observed max" locally
   /MIN_DAYS_FOR_INFLATED_VERDICT\s*=\s*\d/, // redeclaring the shared constant instead of importing it
-  /MIN_OBSERVATIONS_FOR_INFLATED_VERDICT\s*=\s*\d/,
+  /MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT\s*=\s*\d/,
 ];
 
 for (const file of consumerFiles) {
@@ -197,6 +355,25 @@ for (const file of consumerFiles) {
     }
   });
 }
+
+console.log("\nREADME consistency — documented constant names must match what's actually in shared.js");
+// A prior round renamed MIN_OBSERVATIONS_FOR_INFLATED_VERDICT to
+// MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT to reflect its real semantics
+// (distinct days, not raw observation count) but missed updating the
+// README's mention of it — someone tuning the documented name wouldn't
+// find it. This checks the README only ever references constant names
+// that actually exist in shared.js.
+test("README doesn't reference the old, renamed constant name", () => {
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+  assert(!readme.includes("MIN_OBSERVATIONS_FOR_INFLATED_VERDICT"), "README still references the pre-rename constant name");
+});
+test("every ALL_CAPS constant name the README mentions actually exists in shared.js", () => {
+  const readme = fs.readFileSync(path.join(__dirname, "..", "README.md"), "utf8");
+  const mentioned = new Set((readme.match(/`(MIN_[A-Z_]+)`/g) || []).map((m) => m.slice(1, -1)));
+  for (const name of mentioned) {
+    assert(sharedSrc.includes(`const ${name}`), `README mentions \`${name}\`, which doesn't exist in shared.js`);
+  }
+});
 
 console.log(`\n${passed} passed, ${failed} failed (total)`);
 if (failed > 0) process.exit(1);

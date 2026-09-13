@@ -25,17 +25,40 @@ async function main() {
   list.innerHTML = "";
   for (const { domain, meta, history } of entries) {
     const last = history[history.length - 1];
-    // Only compare within the current currency — the same fix applied to
-    // the badge and history chart. An earlier version of this file
-    // predated that fix and compared raw prices across currencies.
-    const sameCurrencyHistory = filterSameCurrency(history, last.c);
-    const low = Math.min(...sameCurrencyHistory.map((h) => h.p));
-    const isLow = last.p <= low + 0.001;
-    // evaluateClaimAt() comes from shared.js — the same canonical
-    // evaluator the badge and history chart use, so this can't silently
-    // disagree with them about the same claim the way it used to.
-    const claim = evaluateClaimAt(history, history.length - 1);
-    const claimFlag = claim?.tone === "bad";
+    const isCurrencyUnknown = last.c == null;
+
+    let midHtml;
+    let claimFlag = false;
+
+    if (isCurrencyUnknown) {
+      // filterSameCurrency() correctly returns nothing comparable for an
+      // unknown currency — Math.min() on that empty result would silently
+      // produce Infinity and misleadingly claim "at its low" for a price
+      // that was never actually compared against anything.
+      midHtml = `
+        <span class="pl-item-price">${fmt(last.p, null)}</span>
+        <span class="pl-item-verdict">currency unknown</span>
+      `;
+    } else {
+      // Only compare within the current currency — the same fix applied
+      // to the badge and history chart. An earlier version of this file
+      // predated that fix and compared raw prices across currencies.
+      const sameCurrencyHistory = filterSameCurrency(history, last.c);
+      const low = Math.min(...sameCurrencyHistory.map((h) => h.p));
+      const isLow = last.p <= low + 0.001;
+      // evaluateClaimAt() comes from shared.js — the same canonical
+      // evaluator the badge and history chart use, so this can't
+      // silently disagree with them about the same claim the way it
+      // used to.
+      const claim = evaluateClaimAt(history, history.length - 1);
+      claimFlag = claim?.tone === "bad";
+      midHtml = `
+        <span class="pl-item-price">${fmt(last.p, last.c)}</span>
+        <span class="pl-item-verdict${isLow ? " pl-good" : ""}">${
+          isLow ? "at its low" : `low was ${fmt(low, last.c)}`
+        }</span>
+      `;
+    }
 
     const row = document.createElement("div");
     row.className = "pl-item";
@@ -45,10 +68,7 @@ async function main() {
         <span class="pl-item-domain">${escapeHtml(domain)}</span>
       </div>
       <div class="pl-item-mid">
-        <span class="pl-item-price">${fmt(last.p, last.c)}</span>
-        <span class="pl-item-verdict${isLow ? " pl-good" : ""}">${
-          isLow ? "at its low" : `low was ${fmt(low, last.c)}`
-        }</span>
+        ${midHtml}
       </div>
       ${claimFlag ? `<div class="pl-item-flag">⚠ "was" claim not corroborated by your history</div>` : ""}
     `;

@@ -82,7 +82,7 @@
       list
         .map((o) => o.price)
         .filter((p) => p !== undefined && p !== null && p !== "")
-        .map((p) => parsePriceAmount(String(p)))
+        .map((p) => parseStructuredPrice(String(p)))
         .filter((p) => p != null)
         .map((p) => p.toFixed(2))
     );
@@ -100,7 +100,7 @@
       if (price !== undefined && price !== null && price !== "") {
         const rawCurrency = offer.priceCurrency ?? offer?.priceSpecification?.priceCurrency;
         const currency = sanitizeCurrency(rawCurrency, inferCurrencyFromDomain());
-        const num = parsePriceAmount(String(price));
+        const num = parseStructuredPrice(String(price));
         if (num != null) return { price: num, currency, isExact: hasExactPrice };
       }
     }
@@ -120,6 +120,27 @@
     return a.includes(b) || b.includes(a) ? 0.5 : 0;
   }
 
+  // A page declaring og:type=product is independent corroboration that
+  // this page is actually about one specific product — useful when a
+  // JSON-LD candidate has no title correspondence to lean on.
+  function pageDeclaresProductType() {
+    const ogType = document.querySelector('meta[property="og:type"]')?.content?.toLowerCase() || "";
+    return ogType.startsWith("product");
+  }
+
+  // Scans the page's visible price-like elements (the same candidates the
+  // DOM-fallback detector considers) for one that roughly matches a given
+  // price. Used to corroborate a JSON-LD price against what's actually
+  // shown on the page — a stale or unrelated structured-data block
+  // wouldn't have anything visible backing it up.
+  function hasVisiblePriceCorroboration(price) {
+    for (const el of findPriceElements()) {
+      const num = extractPriceFromText(el.textContent);
+      if (num != null && Math.abs(num - price) < 0.01) return true;
+    }
+    return false;
+  }
+
   function detectFromJsonLd() {
     const products = parseJsonLdProducts();
     const pageTitle = document.querySelector('meta[property="og:title"]')?.content || document.title || "";
@@ -137,30 +158,74 @@
     // unrelated recommended-item's exact price over the actual product's
     // range-floor price, which is a worse failure than the one this
     // scoring was originally built to prevent.
+    //
+    // But weighting alone doesn't help when EVERY candidate has zero
+    // identity correspondence — e.g. a listing/category page with several
+    // Product objects, none of which match the page's own title. In that
+    // case "pick whichever scores highest" just means "pick the first one
+    // that ties," which is confidently recording a coin-flip.
     let best = null;
     let bestScore = -Infinity;
+    let bestTitleMatch = 0;
+    let viableCandidateCount = 0;
+    let candidatesAtBestScore = [];
     for (const p of products) {
       const priceInfo = extractOfferPrice(p.offers);
       if (!priceInfo) continue;
-      const score = titleSimilarity(p.name, pageTitle) * 10 + (priceInfo.isExact ? 2 : 0);
+      viableCandidateCount++;
+      const titleMatch = titleSimilarity(p.name, pageTitle);
+      const score = titleMatch * 10 + (priceInfo.isExact ? 2 : 0);
       if (score > bestScore) {
         bestScore = score;
+        bestTitleMatch = titleMatch;
         best = { p, priceInfo };
+        candidatesAtBestScore = [{ p, priceInfo }];
+      } else if (score === bestScore) {
+        candidatesAtBestScore.push({ p, priceInfo });
       }
     }
     if (!best) return null;
+    if (viableCandidateCount > 1 && bestTitleMatch === 0) return null;
+
+    // Two (or more) candidates tying on score is only safe to resolve by
+    // picking one if they actually agree on price — e.g. the same product
+    // duplicated in JSON-LD. If they disagree (the classic case: two
+    // color/size variants both named "Widget," each with its own exact
+    // price), picking whichever happened to be scanned first is a coin
+    // flip that could record the wrong variant as a fictional new low.
+    if (candidatesAtBestScore.length > 1) {
+      const distinctPrices = new Set(candidatesAtBestScore.map((c) => c.priceInfo.price.toFixed(2)));
+      if (distinctPrices.size > 1) return null;
+    }
+
+    // A single candidate with zero title correspondence is still
+    // ambiguous on its own — it could be a stale or unrelated Product
+    // object on a homepage, editorial page, or promo banner that happens
+    // to have no competing candidates to lose to. Require independent
+    // corroboration before trusting it: either the page declares itself a
+    // product page, or there's a visible price on the page that actually
+    // matches the JSON-LD price.
+    if (viableCandidateCount === 1 && bestTitleMatch === 0) {
+      const corroborated = pageDeclaresProductType() || hasVisiblePriceCorroboration(best.priceInfo.price);
+      if (!corroborated) return null;
+    }
 
     const { p, priceInfo } = best;
-    const id = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
+    const rawId = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
     return {
       title: (p.name || document.title || "").trim().slice(0, 140),
       image: firstImage(p.image),
-      productKey: id ? `id:${id}` : `name:${normalize(p.name || document.title)}`,
+      productKey: rawId ? `id:${sanitizeIdForKey(rawId)}` : `name:${normalize(p.name || document.title)}`,
       price: priceInfo.price,
       currency: priceInfo.currency,
-      // JSON-LD's Offer schema has no standard "was/RRP" field — that
-      // claim only ever shows up as page text, so scan for it directly.
-      claimedWasPrice: findClaimedWasPrice(),
+      // JSON-LD's Offer schema has no standard "was/RRP" field, and this
+      // detection path has no DOM price element to anchor a scoped
+      // search to (the price came from structured data, not a visible
+      // node) — findClaimedWasPrice() requires an anchor specifically so
+      // it never falls back to searching the whole page, which risked
+      // attributing an unrelated widget's "was" claim to this product.
+      // No anchor here means no claim detected, not a global guess.
+      claimedWasPrice: findClaimedWasPrice(null),
     };
   }
 
@@ -179,6 +244,16 @@
       .slice(0, 80);
   }
 
+  // Page-controlled SKU/GTIN/MPN values (used to build the "id:" storage
+  // key variant) had no equivalent bound — normalize() above caps the
+  // name-based fallback to 80 characters, but a raw identifier went
+  // straight into the key unbounded. A page could supply an arbitrarily
+  // long value here, growing storage for no real benefit (these values
+  // exist to identify a product, not to hold arbitrary data).
+  function sanitizeIdForKey(id) {
+    return String(id).trim().replace(/\s+/g, "-").slice(0, 100);
+  }
+
   // Fallback for pages without JSON-LD: meta tags + a scan for itemprop price.
   // Gated carefully — this path is the one that misfired on listing/search
   // pages, treating "some price on the page" as "the product's price".
@@ -193,7 +268,7 @@
       document.querySelector('meta[property="og:price:amount"]');
 
     if (isDeclaredProductPage && ogPriceEl) {
-      const num = parsePriceAmount(String(ogPriceEl.content));
+      const num = parseStructuredPrice(String(ogPriceEl.content));
       if (num != null) {
         const rawCurrency =
           document.querySelector('meta[property="product:price:currency"]')?.content ||
@@ -210,10 +285,20 @@
     if (isDeclaredProductPage) {
       const itemPropEls = document.querySelectorAll('[itemprop="price"]');
       if (itemPropEls.length === 1) {
-        const raw = itemPropEls[0].getAttribute("content") || itemPropEls[0].textContent;
-        const num = parsePriceAmount(String(raw));
+        // The microdata `content` attribute (when present) is the
+        // machine-readable structured value per the microdata spec — a
+        // plain decimal, same as JSON-LD/meta. Falling back to the
+        // element's rendered textContent is genuinely different: that's
+        // human-formatted display text (could contain a currency symbol,
+        // thousands separators, etc.), so it needs the locale-aware
+        // parser, not the structured one.
+        const contentAttr = itemPropEls[0].getAttribute("content");
+        const num =
+          contentAttr != null
+            ? parseStructuredPrice(String(contentAttr))
+            : extractPriceFromText(itemPropEls[0].textContent);
         if (num != null) {
-          return buildMetaProduct(num, inferCurrencyFromDomain());
+          return buildMetaProduct(num, inferCurrencyFromDomain(), itemPropEls[0]);
         }
       }
     }
@@ -239,11 +324,24 @@
     "www.woolworths.com.au": '[class*="product-price_component_price-lead"]',
   };
 
+  // display:none, visibility:hidden, or a fully collapsed layout (zero
+  // client rects — catches display:none on an ancestor too) all mean
+  // "not what the user is actually looking at." A hidden responsive
+  // layout variant, an inactive carousel slide, or a stale variant panel
+  // could otherwise outrank the genuinely visible price just by having
+  // larger font-size in its own (unrendered) styling.
+  function isVisible(el) {
+    const style = getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    return el.getClientRects().length > 0;
+  }
+
   function findPriceElements() {
     const looksLikePrice = /(?:\$|£|€)\s?\d/;
     const nodes = document.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
     const candidates = [];
     for (const el of nodes) {
+      if (!isVisible(el)) continue;
       const text = el.textContent.trim();
       if (!looksLikePrice.test(text) || text.length > 24) continue;
       const flag = `${el.className} ${el.id}`.toLowerCase();
@@ -267,15 +365,83 @@
   }
 
   // ---------- 1c. Claimed "was"/RRP price ----------
+
+  // Common naming conventions for "a different section, not this
+  // product's own content" — recommendation widgets, related-item rails,
+  // upsell carousels. Not exhaustive (no fixed list of class names ever
+  // is), but real e-commerce markup overwhelmingly uses recognizable
+  // naming for these sections, and this is checked alongside the
+  // signal-count heuristic below rather than relied on alone.
+  const UNRELATED_SECTION_PATTERN = /recommend|related|similar|carousel|suggest|cross-?sell|upsell|also-?(bought|like)|you-?may-?also/;
+
+  function looksLikeUnrelatedSection(el) {
+    const flag = `${el.className || ""} ${el.id || ""}`.toLowerCase();
+    return UNRELATED_SECTION_PATTERN.test(flag);
+  }
+
+  // Counts elements that look like a price signal — current-price-styled
+  // or an explicit strikethrough/comparison price — within a container.
+  // One product's own block typically has at most two: its current price
+  // and, sometimes, one "was" price. A container whose count grows past
+  // that has likely swept in another product's price information too.
+  function countPriceSignals(container) {
+    const priceClassNodes = container.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
+    const strikeNodes = container.querySelectorAll("del, s, strike");
+    return new Set([...priceClassNodes, ...strikeNodes]).size;
+  }
+
+  // Walks up from a price element toward a container that plausibly
+  // represents "this product's own block," stopping as soon as expanding
+  // further shows real evidence of ambiguity — a sibling subtree named
+  // like a different section, or the total price-signal count growing
+  // beyond what one product's own current+was price pair would produce —
+  // rather than climbing a fixed number of levels regardless of what's
+  // actually there. A fixed-depth walk previously stopped at whatever
+  // ancestor happened to be N levels up (often <main> or similar in
+  // ordinary markup), which could still contain an entire unrelated
+  // recommendations section as a sibling.
+  function findLocalContainer(el, maxLevels = 8) {
+    let node = el;
+    for (let i = 0; i < maxLevels; i++) {
+      const parent = node.parentElement;
+      if (!parent || parent === document.body) break;
+
+      const hasUnrelatedSibling = Array.from(parent.children).some(
+        (sibling) => sibling !== node && looksLikeUnrelatedSection(sibling)
+      );
+      if (hasUnrelatedSibling) break;
+
+      if (countPriceSignals(parent) > 2) break;
+
+      node = parent;
+    }
+    return node;
+  }
+
   // Captures the figure the retailer wants you to compare against — a
-  // struck-through "was $X", an RRP, or a "compare at" price — so it can be
-  // checked against what THIS browser has actually observed, rather than
-  // trusted at face value.
-  function findClaimedWasPrice() {
+  // struck-through "was $X", an RRP, or a "compare at" price — so it can
+  // be checked against what THIS browser has actually observed, rather
+  // than trusted at face value.
+  //
+  // Requires an anchor element (the actual current-price DOM node) and
+  // searches only its local neighborhood, not the whole document.
+  // Searching the whole page previously meant an unrelated "was $100" on
+  // a completely different recommended-item widget could get attributed
+  // to the actual product being tracked — Price Historian would then
+  // judge that claim against history for an item that never made it.
+  // Callers with no DOM element to anchor to (JSON-LD or meta-tag-only
+  // detection, where the price comes from structured data rather than a
+  // visible element) don't attempt claim detection at all rather than
+  // guessing across the whole page.
+  function findClaimedWasPrice(anchorEl) {
+    if (!anchorEl) return null;
+    const scopeRoot = findLocalContainer(anchorEl);
+
     // Prefer genuine <del>/<s>/<strike> markup first — that's an explicit,
     // unambiguous semantic signal a page can't casually get wrong.
-    const strikeEls = document.querySelectorAll("del, s, strike");
+    const strikeEls = scopeRoot.querySelectorAll("del, s, strike");
     for (const el of strikeEls) {
+      if (!isVisible(el)) continue;
       const text = el.textContent.trim();
       if (text.length >= 24) continue;
       const price = extractPriceFromText(text);
@@ -284,8 +450,9 @@
 
     // Fall back to the same class/id keyword heuristic used to exclude
     // these from the current-price detector — same signal, opposite intent.
-    const nodes = document.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
+    const nodes = scopeRoot.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
     for (const el of nodes) {
+      if (!isVisible(el)) continue;
       const flag = `${el.className} ${el.id}`.toLowerCase();
       if (!/was|rrp|strike|compare-?at/.test(flag)) continue;
       const text = el.textContent.trim();
@@ -358,7 +525,7 @@
       // the dedupe check — a claim appearing/disappearing/changing with the
       // price otherwise unchanged is still a real change worth recording,
       // so it needs to be part of the key, not just price/title/pathname.
-      const product = buildMetaProduct(num, inferCurrencyFromDomain());
+      const product = buildMetaProduct(num, inferCurrencyFromDomain(), el);
       const title = currentTitleGuess();
       const key = `${location.pathname}::${title}::${num}::${product.claimedWasPrice ?? "none"}`;
       if (key === lastKey) return; // no meaningful change since last observation
@@ -392,7 +559,7 @@
     activeWatcherTimeoutId = setTimeout(stopDomPriceWatcher, 45 * 60 * 1000);
   }
 
-  function buildMetaProduct(price, currency) {
+  function buildMetaProduct(price, currency, anchorEl) {
     const title =
       document.querySelector('meta[property="og:title"]')?.content ||
       document.title;
@@ -404,7 +571,7 @@
       productKey: `name:${normalize(title)}`,
       price,
       currency,
-      claimedWasPrice: findClaimedWasPrice(),
+      claimedWasPrice: findClaimedWasPrice(anchorEl || null),
     };
   }
 
@@ -567,8 +734,14 @@
     // the last index reads today's actual claim, not a stale one.
     const result = evaluateClaimAt(history, history.length - 1);
     if (!result) return null;
-    const { tone, was, currency, observedMax, pastCount, daysTracked } = result;
+    const { tone, currencyUnknown, was, currency, observedMax, pastCount, distinctDays, daysTracked } = result;
 
+    if (currencyUnknown) {
+      return {
+        tone,
+        text: `Claims "was ${was}" — currency unknown for this site, can't verify against history.`,
+      };
+    }
     if (tone === "neutral" && pastCount === 0) {
       return {
         tone,
@@ -584,12 +757,12 @@
     if (tone === "neutral") {
       return {
         tone,
-        text: `Only ${pastCount} check(s) over ${Math.max(1, Math.round(daysTracked))} day(s) so far — not enough history yet to confirm or challenge the "was ${fmt(was, currency)}" claim.`,
+        text: `Only checked on ${distinctDays} distinct day(s) over a ${Math.max(1, Math.round(daysTracked))}-day span so far — not enough history yet to confirm or challenge the "was ${fmt(was, currency)}" claim.`,
       };
     }
     return {
       tone,
-      text: `${pastCount} checks over ${Math.round(daysTracked)} days, never above ${fmt(observedMax, currency)} — the "was ${fmt(was, currency)}" claim isn't corroborated by your observed history.`,
+      text: `Checked on ${distinctDays} distinct days over ${Math.round(daysTracked)} days, never above ${fmt(observedMax, currency)} — the "was ${fmt(was, currency)}" claim isn't corroborated by your observed history.`,
     };
   }
 
@@ -627,6 +800,9 @@
       bottom: 18px;
       right: 18px;
       z-index: 2147483647;
+      display: block;
+    }
+    .pl-badge-inner {
       width: 236px;
       background: #101814;
       border: 1px solid #2a362f;
@@ -636,10 +812,9 @@
       font-family: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
       color: #EDEAE0;
       animation: pl-rise 220ms ease-out;
-      display: block;
       box-sizing: border-box;
     }
-    :host(.pl-alert) { border-color: #6b3630; }
+    .pl-badge-inner.pl-alert { border-color: #6b3630; }
     @keyframes pl-rise {
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
@@ -647,7 +822,7 @@
     .pl-row { display: flex; align-items: center; width: 100%; box-sizing: border-box; }
     .pl-head { gap: 6px; margin-bottom: 6px; }
     .pl-dot { width: 6px; height: 6px; border-radius: 50%; background: #E8A33D; flex: none; }
-    :host(.pl-good) .pl-dot { background: #3FA796; }
+    .pl-badge-inner.pl-good .pl-dot { background: #3FA796; }
     .pl-title {
       font-size: 10px; letter-spacing: 0.02em; color: #A8AFA6; flex: 1;
       overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -657,9 +832,9 @@
     .pl-price-row { justify-content: space-between; margin-bottom: 4px; }
     .pl-price { font-size: 18px; font-weight: 600; color: #EDEAE0; letter-spacing: -0.01em; }
     .pl-spark { width: 78px; height: 24px; color: #E8A33D; flex: none; }
-    :host(.pl-good) .pl-spark { color: #3FA796; }
+    .pl-badge-inner.pl-good .pl-spark { color: #3FA796; }
     .pl-verdict { font-size: 11px; color: #E8A33D; margin-bottom: 3px; }
-    :host(.pl-good) .pl-verdict { color: #3FA796; }
+    .pl-badge-inner.pl-good .pl-verdict { color: #3FA796; }
     .pl-meta { font-size: 9.5px; color: #6B756E; line-height: 1.4; }
     .pl-claim {
       font-size: 9.5px; line-height: 1.4; margin-top: 6px; padding-top: 6px;
@@ -675,50 +850,84 @@
   function renderBadge(product, history) {
     document.getElementById("price-ledger-badge-host")?.remove();
 
-    // Same-currency filtering matters here too — a badge showing "low
-    // $65" against a $100 history that switched currency mid-stream would
-    // be comparing numbers that aren't actually commensurable.
-    const sameCurrencyHistory = filterSameCurrency(history, product.currency);
-    const prices = sameCurrencyHistory.map((h) => h.p);
-    const low = Math.min(...prices, product.price);
-    const high = Math.max(...prices, product.price);
-    const isAtLow = product.price <= low + 0.001;
-    const diffFromLow = product.price - low;
-    const claim = evaluateClaim(product, history);
-
     const host = document.createElement("div");
     host.id = "price-ledger-badge-host";
-    let stateClass = isAtLow ? "pl-good" : "";
-    if (claim?.tone === "bad") stateClass = "pl-alert";
-    if (stateClass) host.classList.add(stateClass);
-
+    // The host's own class/id are the only things externally visible to
+    // the page (that's unavoidable — the page can always see *that*
+    // something is injected). Deliberately state-neutral: it never
+    // changes based on the verdict, so a page can't learn "pl-good vs
+    // pl-alert" just by reading host.className. The actual state class
+    // lives on an element inside the closed shadow root instead, which
+    // external scripts can't reach.
     const shadow = host.attachShadow({ mode: "closed" });
     badgeShadowRoot = shadow;
 
-    const verdict = isAtLow
-      ? sameCurrencyHistory.length > 1
-        ? "Lowest you've seen"
-        : "First time tracking this"
-      : `${fmt(diffFromLow, product.currency)} above your low`;
+    const isCurrencyUnknown = product.currency == null;
+    const claim = isCurrencyUnknown ? null : evaluateClaim(product, history);
+
+    let innerStateClass = "";
+    let bodyHtml;
+
+    if (isCurrencyUnknown) {
+      // No same-currency history exists or ever could be trusted here —
+      // rendering a normal "lowest you've seen" verdict would be
+      // trivially true for every single visit (there's nothing
+      // comparable to lose to) and would misleadingly imply a real
+      // comparison happened. Say plainly that one didn't.
+      bodyHtml = `
+        <div class="pl-row pl-head">
+          <span class="pl-dot"></span>
+          <span class="pl-title">${escapeHtml(truncate(product.title, 34))}</span>
+          <button class="pl-close" title="Dismiss">&times;</button>
+        </div>
+        <div class="pl-row pl-price-row">
+          <span class="pl-price">${fmt(product.price, product.currency)}</span>
+        </div>
+        <div class="pl-row pl-meta">Currency unknown for this site — historical comparison unavailable.</div>
+      `;
+    } else {
+      // Same-currency filtering matters here too — a badge showing "low
+      // $65" against a $100 history that switched currency mid-stream
+      // would be comparing numbers that aren't actually commensurable.
+      const sameCurrencyHistory = filterSameCurrency(history, product.currency);
+      const prices = sameCurrencyHistory.map((h) => h.p);
+      const low = Math.min(...prices, product.price);
+      const high = Math.max(...prices, product.price);
+      const isAtLow = product.price <= low + 0.001;
+      const diffFromLow = product.price - low;
+
+      innerStateClass = isAtLow ? "pl-good" : "";
+      if (claim?.tone === "bad") innerStateClass = "pl-alert";
+
+      const verdict = isAtLow
+        ? sameCurrencyHistory.length > 1
+          ? "Lowest you've seen"
+          : "First time tracking this"
+        : `${fmt(diffFromLow, product.currency)} above your low`;
+
+      bodyHtml = `
+        <div class="pl-row pl-head">
+          <span class="pl-dot"></span>
+          <span class="pl-title">${escapeHtml(truncate(product.title, 34))}</span>
+          <button class="pl-close" title="Dismiss">&times;</button>
+        </div>
+        <div class="pl-row pl-price-row">
+          <span class="pl-price">${fmt(product.price, product.currency)}</span>
+          ${buildSparkline(sameCurrencyHistory)}
+        </div>
+        <div class="pl-row pl-verdict">${verdict}</div>
+        ${
+          sameCurrencyHistory.length > 1
+            ? `<div class="pl-row pl-meta">Low ${fmt(low, product.currency)} · High ${fmt(high, product.currency)} · ${sameCurrencyHistory.length} checks</div>`
+            : `<div class="pl-row pl-meta">Come back later — history builds as you browse.</div>`
+        }
+        ${claim ? `<div class="pl-row pl-claim pl-claim-${claim.tone}">${escapeHtml(claim.text)}</div>` : ""}
+      `;
+    }
 
     shadow.innerHTML = `
       <style>${BADGE_SHADOW_CSS}</style>
-      <div class="pl-row pl-head">
-        <span class="pl-dot"></span>
-        <span class="pl-title">${escapeHtml(truncate(product.title, 34))}</span>
-        <button class="pl-close" title="Dismiss">&times;</button>
-      </div>
-      <div class="pl-row pl-price-row">
-        <span class="pl-price">${fmt(product.price, product.currency)}</span>
-        ${buildSparkline(sameCurrencyHistory)}
-      </div>
-      <div class="pl-row pl-verdict">${verdict}</div>
-      ${
-        sameCurrencyHistory.length > 1
-          ? `<div class="pl-row pl-meta">Low ${fmt(low, product.currency)} · High ${fmt(high, product.currency)} · ${sameCurrencyHistory.length} checks</div>`
-          : `<div class="pl-row pl-meta">Come back later — history builds as you browse.</div>`
-      }
-      ${claim ? `<div class="pl-row pl-claim pl-claim-${claim.tone}">${escapeHtml(claim.text)}</div>` : ""}
+      <div class="pl-badge-inner${innerStateClass ? " " + innerStateClass : ""}">${bodyHtml}</div>
     `;
 
     shadow.querySelector(".pl-close").addEventListener("click", () => host.remove());

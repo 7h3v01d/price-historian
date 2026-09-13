@@ -81,6 +81,26 @@ function parsePriceAmount(raw) {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
+// Parses a machine-readable structured price value — JSON-LD's
+// Offer.price/lowPrice, Open Graph's price:amount meta content, or
+// itemprop="price". These are specified (schema.org, Open Graph) as plain
+// decimal numbers using '.' as the decimal point — never locale-formatted,
+// never using a thousands separator. Routing them through the
+// locale-guessing heuristic built for human-readable page text (see
+// parsePriceAmount above) caused a real corruption: currencies that
+// legitimately display three fractional digits (KWD, BHD, OMR, JOD, TND —
+// e.g. "1.250" meaning 1.25) were misread as thousands-grouped integers,
+// multiplying the value by 1000. A direct numeric parse is both simpler
+// and more correct for this data source — no grouping heuristic needed or
+// wanted, because none should ever apply here.
+function parseStructuredPrice(raw) {
+  if (raw === undefined || raw === null || raw === "") return null;
+  const s = String(raw).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return null; // not a clean plain decimal — reject rather than guess
+  const num = parseFloat(s);
+  return Number.isFinite(num) && num > 0 ? num : null;
+}
+
 // Finds a currency-symbol-prefixed amount in arbitrary page text and
 // parses it through parsePriceAmount(). Returns a number, or null if no
 // plausible/unambiguous price is found — callers should treat null as
@@ -114,7 +134,20 @@ function sanitizeCurrency(code, fallback) {
 // currencies as if they were commensurable numbers (e.g. treating a $65
 // USD price as a new low against a $100 AUD history) would be a silent
 // correctness bug, not just a display quirk.
+//
+// Critically: a null/unknown currency must NEVER be treated as matching
+// another null/unknown currency. "Unknown" means "we don't have enough
+// information to establish comparability," not "these all belong to one
+// currency named null" — two genuinely different currencies could both
+// end up unlabeled (e.g. a storefront that silently switches region), and
+// grouping them together would reproduce the exact cross-currency
+// corruption this function exists to prevent, just with an extra step.
+// A null target currency is therefore never comparable to anything,
+// including other nulls — the caller gets an empty series and correctly
+// treats that as "no historical comparison available" rather than a
+// fabricated one.
 function filterSameCurrency(history, currency) {
+  if (currency == null) return [];
   return history.filter((h) => h.c === currency);
 }
 
@@ -125,7 +158,16 @@ function filterSameCurrency(history, currency) {
 // technically span 14 days but don't actually establish much about what
 // happened in between.
 const MIN_DAYS_FOR_INFLATED_VERDICT = 14;
-const MIN_OBSERVATIONS_FOR_INFLATED_VERDICT = 4;
+const MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT = 4;
+
+// How many distinct calendar days a set of observations spans — not the
+// same as how many observation rows exist. Same-day claim changes are
+// intentionally recorded as separate rows (see recordObservation in
+// content.js), so counting rows would let e.g. 4 same-day claim edits
+// satisfy an evidence threshold meant to require broad time coverage.
+function countDistinctDays(points) {
+  return new Set(points.map((h) => new Date(h.t).toDateString())).size;
+}
 
 // ---------- Canonical claim evaluation ----------
 // The single source of truth for "does this was-price claim check out
@@ -144,25 +186,49 @@ const MIN_OBSERVATIONS_FOR_INFLATED_VERDICT = 4;
 function evaluateClaimAt(history, index) {
   const point = history[index];
   if (!point || point.w == null) return null;
-
-  // Only compare within the same currency as this point — mixing
-  // currency series would make "observed max" meaningless.
-  const past = history.slice(0, index).filter((h) => h.c === point.c);
   const was = point.w;
 
+  // An unknown currency for the point being evaluated means there is
+  // nothing safe to compare it against, full stop — not "first time
+  // tracking" (which implies more visits would resolve it) but "we
+  // genuinely can't establish comparability here." Distinguished via
+  // `currencyUnknown` so callers can word this differently from a
+  // could-resolve-with-more-data neutral state.
+  if (point.c == null) {
+    return {
+      tone: "neutral",
+      currencyUnknown: true,
+      was,
+      currency: null,
+      observedMax: null,
+      pastCount: 0,
+      distinctDays: 0,
+      daysTracked: 0,
+    };
+  }
+
+  // filterSameCurrency() is the single source of truth for currency
+  // matching — including its rule that a null currency never matches
+  // another null. Using it here (rather than a local `.filter(h => h.c
+  // === point.c)`) means that rule can't drift out of sync between this
+  // function and the rest of the codebase the way it briefly did between
+  // files before evaluateClaimAt itself was centralized.
+  const past = filterSameCurrency(history.slice(0, index), point.c);
+
   if (!past.length) {
-    return { tone: "neutral", was, currency: point.c, observedMax: null, pastCount: 0, daysTracked: 0 };
+    return { tone: "neutral", was, currency: point.c, observedMax: null, pastCount: 0, distinctDays: 0, daysTracked: 0 };
   }
 
   const observedMax = Math.max(...past.map((h) => h.p));
   const tolerance = was * 0.03; // small wiggle room for rounding/cent differences
+  const distinctDays = countDistinctDays(past);
   if (observedMax >= was - tolerance) {
-    return { tone: "good", was, currency: point.c, observedMax, pastCount: past.length, daysTracked: null };
+    return { tone: "good", was, currency: point.c, observedMax, pastCount: past.length, distinctDays, daysTracked: null };
   }
 
   const daysTracked = (past[past.length - 1].t - past[0].t) / 86400000;
   const hasEnoughEvidence =
-    daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT && past.length >= MIN_OBSERVATIONS_FOR_INFLATED_VERDICT;
+    daysTracked >= MIN_DAYS_FOR_INFLATED_VERDICT && distinctDays >= MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT;
 
   return {
     tone: hasEnoughEvidence ? "bad" : "neutral",
@@ -170,6 +236,7 @@ function evaluateClaimAt(history, index) {
     currency: point.c,
     observedMax,
     pastCount: past.length,
+    distinctDays,
     daysTracked,
   };
 }

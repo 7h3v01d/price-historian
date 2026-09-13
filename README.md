@@ -111,7 +111,7 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
   rather than accusatory, since ruling a claim uncorroborated and proving
   it's actually inflated are different strengths of evidence. Both
   thresholds are judgment calls — `MIN_DAYS_FOR_INFLATED_VERDICT` and
-  `MIN_OBSERVATIONS_FOR_INFLATED_VERDICT` in `shared.js`, used by
+  `MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT` in `shared.js`, used by
   `content.js`, `history.js`, and `popup.js` — tune them there if needed.
 - **Spend summary groups by currency rather than assuming one.** If
   tracked items span more than one currency, the summary now renders a
@@ -257,3 +257,156 @@ Both were independently reproduced before fixing, same as the first round:
   file, and it fails as expected). This is a genuine start, not a
   finished suite — it doesn't yet cover JSON-LD scoring, the DOM
   watcher's dedupe key, or true end-to-end integration testing.
+
+### Third hardening pass
+
+A third adversarial review of 0.9.1 found two release-blocking correctness
+bugs plus several secondary issues — all independently reproduced before
+fixing, and this round's fixes surfaced two more latent crash bugs of
+their own while being implemented, which are also documented below rather
+than left for someone else to find.
+
+- **Unknown currency was accidentally treated as A currency.** After the
+  previous round stopped guessing "USD" for unlabeled prices, two
+  genuinely different unknown-currency observations (e.g. a storefront
+  silently switching region between visits) were still grouped together
+  as if `null` were a real, consistent currency — reproducing the exact
+  cross-currency corruption bug from two rounds ago, just relabeled.
+  `filterSameCurrency()` now treats a `null` currency as never matching
+  anything, including another `null` — "unknown" means "nothing is
+  comparable," not "everything unknown belongs to one currency."
+- **Three-decimal currencies (KWD, BHD, OMR, JOD, TND) were corrupted
+  1000×.** The locale-guessing price parser's "exactly 3 digits after the
+  separator means thousands-grouping" heuristic — built for human-typed
+  page text — was also being applied to machine-readable JSON-LD/meta
+  price fields, which are always plain decimals per spec and never
+  locale-formatted. `"1.250"` (a legitimate 1.25 KWD) was misread as
+  1250. Added `parseStructuredPrice()`, a separate, simpler parser with no
+  grouping heuristic at all, for every JSON-LD/meta/itemprop call site;
+  the locale-aware parser now only ever sees actual DOM display text.
+- **"Was" claims could be attributed to the wrong product.** Claim
+  detection searched the entire page for struck-through prices, so an
+  unrelated "was $100" on a recommended-item widget elsewhere on the page
+  could get attributed to the actual product being tracked.
+  `findClaimedWasPrice()` now requires an anchor element (the real
+  detected price node) and searches only a bounded local neighborhood
+  around it — verified with a DOM test against both the exact
+  cross-attribution scenario (now correctly ignored) and a genuinely
+  co-located claim (still detected).
+- **The closed Shadow DOM still leaked the verdict.** The private
+  price/history text was already protected, but the badge's `pl-good`/
+  `pl-alert` state class was applied to the externally-visible host
+  element itself — readable via a plain `.className` check, revealing
+  "your price is at its historical low" or "our claim check failed"
+  without needing to breach the shadow root at all. The state class now
+  lives on an element inside the closed shadow root; the host is
+  state-neutral regardless of verdict, verified with a DOM test.
+- **JSON-LD candidate scoring had no minimum identity floor.** The
+  previous round's rebalanced weighting fixed the specific inversion it
+  targeted, but a listing/category page with several unrelated `Product`
+  objects (none matching the page's own title) could still all tie at
+  the same price-only score, with the first one arbitrarily winning.
+  Detection now rejects rather than guesses when multiple candidates
+  exist and none shows real title correspondence — a single candidate is
+  still accepted regardless of title match, since there's nothing to
+  disambiguate and no reason to doubt the only option.
+- **Evidence thresholds counted observation rows, not observation days.**
+  Since claim changes are (correctly, per the previous round's fix)
+  recorded as separate same-day rows, several rapid same-day edits could
+  satisfy the "at least 4 observations" threshold while representing only
+  one or two days of actual coverage. The threshold now requires distinct
+  calendar days (`MIN_OBSERVATION_DAYS_FOR_INFLATED_VERDICT`), not raw
+  row count.
+- **Two crash bugs surfaced while fixing the currency bug above.**
+  Correctly making `filterSameCurrency()` return an empty array for
+  unknown currency exposed several places that assumed a non-empty
+  result: `Math.min(...[])` silently returns `Infinity`, which would have
+  shown a nonsensical "low: Infinity" or, in the spend summary, crashed
+  outright reading `.p` off `undefined` in an empty history array. Fixed
+  in the badge, the history chart, the popup list, the spend summary
+  (which now excludes unknown-currency products with an honest count
+  rather than crashing), and the cross-retailer comparison view (which
+  also had its own related bug: two unknown-currency members were
+  incorrectly treated as "not mixed" since they shared the same `null`
+  value — fixed to treat any unknown currency as always non-comparable,
+  consistent with the main fix).
+- **The test suite grew to 56 checks**, adding coverage for all of the
+  above: the null-currency-never-matches rule, the three-decimal
+  structured-price parser, distinct-day evidence counting, and
+  structural checks confirming the JSON-LD identity floor, the
+  claim-scoping anchor requirement, the Shadow DOM host neutrality, and
+  each of the five empty-array guards are actually present in source —
+  the same style of regression test that caught the `popup.js` drift in
+  the previous round, applied to this round's fixes.
+
+### Fourth hardening pass
+
+A fourth adversarial review found the previous round's JSON-LD identity
+floor and claim-scoping fixes were both real improvements but not
+complete — each still had a gap that could attribute a price or claim to
+the wrong product. Also verified by reproduction before fixing.
+
+- **A single JSON-LD candidate with zero title correspondence was still
+  accepted unconditionally.** The identity floor from the previous round
+  only rejected when *multiple* candidates existed with no identity
+  match — a single unrelated `Product` object (a featured item on a
+  homepage, a stale structured-data block, an editorial page) had nothing
+  to compete against and sailed through. Now requires independent
+  corroboration in that specific case: either the page declares itself a
+  product page (`og:type=product`), or there's a visible price on the
+  page that actually matches the JSON-LD price. Reproduced the exact
+  homepage scenario and confirmed it's now rejected without
+  corroboration.
+- **Tied candidates with conflicting prices were resolved by document
+  order.** Two JSON-LD `Product` objects that scored identically (e.g.
+  two color/size variants, both named "Widget," each with its own exact
+  price) picked whichever was scanned first — arbitrary, and capable of
+  recording the wrong variant's price as a fictional new low. Detection
+  now tracks every candidate tied for the top score and rejects the
+  whole detection if they disagree on price, rather than guessing.
+- **Claim scoping's fixed-depth ancestor walk could still reach an
+  unrelated section.** A bounded climb of a fixed number of levels
+  doesn't account for how shallow ordinary DOM structures often are — in
+  one reproduced case, climbing just two real levels already reached
+  `<main>`, which still contained an entire sibling recommendations
+  section. Replaced the fixed depth with an ambiguity-aware walk: it
+  stops before including a sibling subtree named like a distinctly
+  different section (recommendations, related items, carousels — checked
+  via common naming conventions) and, as a second independent check,
+  stops if the total count of price-like signals in scope exceeds what
+  one product's own current+was price pair should produce. Verified with
+  a DOM test against both the exact failing scenario (now correctly
+  excluded) and a genuinely co-located claim (still detected).
+- **Price and claim detection didn't check element visibility.** A
+  hidden responsive-layout price, an inactive carousel slide, or a stale
+  variant panel under `display:none` could still be selected — a hidden
+  32px desktop-layout price would outrank a visible 28px mobile one
+  purely on font-size, since nothing checked whether either was actually
+  shown. Both detectors now skip elements that are hidden via
+  `display:none`, `visibility:hidden`, `opacity:0`, or have no client
+  rects at all (a reliable catch-all for a hidden ancestor collapsing an
+  element's rendered size to nothing). Worth noting honestly: the
+  client-rects check can't be verified by this project's test suite,
+  since it runs on plain Node rather than a real browser and Node has no
+  layout engine to produce rects at all — it's verified correct by
+  reasoning about how the DOM API actually behaves in Chrome, not by an
+  automated test, which is a real gap the next round of testing
+  infrastructure should close.
+- **Page-controlled SKU/GTIN values had no length bound going into
+  storage keys.** The name-based fallback key was already capped at 80
+  characters; the identifier-based variant used a page-supplied value
+  directly with no bound at all, so an unusually large SKU field could
+  bloat storage keys for no real benefit. Now trimmed and capped at 100
+  characters.
+- **Documentation drift**: the README referenced the pre-rename constant
+  name (missing the "DAYS" qualifier) after a previous round renamed it
+  to reflect its actual distinct-days semantics. Fixed, and a new test
+  now checks every constant name the README mentions actually exists in
+  `shared.js`, so this specific class of drift can't recur silently.
+- **Removed the `host_permissions: ["<all_urls>"]` grant.** It was
+  redundant — content scripts are declared statically via
+  `content_scripts.matches`, which already grants injection access to
+  http/https pages on its own; `host_permissions` is separately needed
+  only for things like cross-origin `fetch()` from extension pages or
+  dynamic script injection, neither of which this extension does.
+- **The test suite grew to 63 checks.**
