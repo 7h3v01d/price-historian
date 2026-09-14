@@ -94,6 +94,125 @@ function selectBestJsonLdCandidate(candidates, pageTitle) {
   return { candidate: best, bestTitleMatch, viableCandidateCount: candidates.length };
 }
 
+// A Product with multiple offers that disagree on price, currency, or
+// exact-vs-range type is ambiguous from JSON-LD alone — there's no
+// reliable way to tell which offer corresponds to what's actually shown
+// on this specific page. Confidently picking the first one risks silently
+// tracking the wrong variant's price; rejecting is safer than guessing.
+//
+// `list` is an array of plain offer-like objects: { price?, lowPrice?,
+// priceSpecification?: { price?, priceCurrency? }, priceCurrency? }.
+// `currencyFallback` is used for offers with no explicit currency of
+// their own (typically the page's own inferred domain currency).
+//
+// The identity key covers all three material dimensions, not price
+// alone: comparing only toFixed(2)-rounded prices collapsed genuinely
+// different three-decimal-currency values (KWD 1.250 vs 1.251) into "the
+// same," and ignoring currency meant AUD 100 and USD 100 weren't treated
+// as materially different just because the numbers match. lowPrice and
+// priceSpecification.price are included alongside exact `price` too — an
+// earlier version only fed exact price values into this check, so two
+// conflicting non-exact offers could slip through undetected.
+function offersAreAmbiguous(list, currencyFallback) {
+  const offerIdentities = new Set();
+  for (const offer of list) {
+    const hasExactPrice = offer.price !== undefined && offer.price !== null && offer.price !== "";
+    const rawPrice = offer.price ?? offer.lowPrice ?? offer?.priceSpecification?.price;
+    if (rawPrice === undefined || rawPrice === null || rawPrice === "") continue;
+    const num = parseStructuredPrice(String(rawPrice));
+    if (num == null) continue;
+    const rawCurrency = offer.priceCurrency ?? offer?.priceSpecification?.priceCurrency;
+    const currency = sanitizeCurrency(rawCurrency, currencyFallback);
+    offerIdentities.add([num.toFixed(6), currency || "", hasExactPrice ? "exact" : "range"].join("|"));
+  }
+  return offerIdentities.size > 1;
+}
+
+// ---------- Claim container scoping ----------
+// Extracted from content.js for the same reason as the JSON-LD selection
+// logic above: this is exactly where adversarial review kept finding real
+// gaps (a generically-named `<aside class="promo">` sibling wasn't caught
+// by naming conventions; a raw price-signal count of exactly 2 looked
+// identical whether it was "one product's own current+was pair" or "one
+// product's price plus an unrelated section's price"), and needs to be
+// testable against real DOM fixtures to have any confidence in it.
+
+// Common naming conventions for "a different section, not this product's
+// own content" — recommendation widgets, related-item rails, upsell
+// carousels. Not exhaustive (no fixed list of class names ever is, and a
+// section can be named anything — "promo", "aside", "deal" — without
+// matching any fixed keyword list), so this is one input signal among
+// several below, never relied on alone.
+const UNRELATED_SECTION_PATTERN = /recommend|related|similar|carousel|suggest|cross-?sell|upsell|also-?(bought|like)|you-?may-?also/;
+
+function looksLikeUnrelatedSection(el) {
+  const flag = `${el.className || ""} ${el.id || ""}`.toLowerCase();
+  return UNRELATED_SECTION_PATTERN.test(flag);
+}
+
+// True if `el` itself IS a claim/comparison-price element — a direct
+// <del>/<s>/<strike>, or something styled as a was/RRP price. This is the
+// thing claim detection is actually looking for, so a sibling that
+// matches this is exactly what should be included when expanding the
+// search — it's the claim itself, not a separate block containing one.
+function isClaimLeaf(el) {
+  const tag = el.tagName ? el.tagName.toLowerCase() : "";
+  if (tag === "del" || tag === "s" || tag === "strike") return true;
+  const flag = `${el.className || ""} ${el.id || ""}`.toLowerCase();
+  return /price/.test(flag) && /was|rrp|strike|compare-?at/.test(flag);
+}
+
+// True if `el` is NOT itself a claim (see isClaimLeaf) but CONTAINS one,
+// or any other price-like element, somewhere nested inside it. This is
+// the actual distinguishing signal a raw price-signal count couldn't
+// provide: a direct <del> sibling sitting right next to the current price
+// is exactly what we want (isClaimLeaf handles that case), but a sibling
+// CONTAINER — regardless of what it's named — that merely happens to have
+// a price or claim buried somewhere inside it is a structurally separate
+// block (a recommendation card, a promo widget, a related-item tile), not
+// this product's own content.
+function containsNestedPriceOrClaim(el) {
+  if (isClaimLeaf(el)) return false;
+  return el.querySelectorAll('del, s, strike, [class*="price" i], [id*="price" i], [data-testid*="price" i]').length > 0;
+}
+
+// Walks up from a price element toward a container that plausibly
+// represents "this product's own block," growing one level at a time and
+// stopping the INSTANT expansion would sweep in a sibling that isn't
+// itself part of the claim but wraps something price-like nested inside
+// it. A prior version used a raw price-signal COUNT threshold (reject
+// once a container held more than 2 total price-like elements) — that
+// failed on the minimal case where a price and an unrelated promo's claim
+// are both direct children of the same wrapper with nothing else around
+// them: exactly 2 signals, under the old threshold, silently wrong. This
+// version doesn't count at all; it asks, at each single step, "does this
+// specific expansion introduce a new sibling that is itself a separate
+// commerce block?" — which correctly distinguishes a direct <del>
+// sibling (the claim itself, wanted) from a sibling container that
+// merely has one nested inside (a different block, not wanted),
+// regardless of what either is named or how many total signals end up in
+// scope.
+//
+// `documentRef` is passed explicitly (rather than assumed to be the
+// global `document`) specifically so this can be tested against a jsdom
+// document without needing to swap browser globals — content.js's real
+// call site just passes its own `document`.
+function findLocalContainer(el, documentRef, maxLevels = 8) {
+  let node = el;
+  for (let i = 0; i < maxLevels; i++) {
+    const parent = node.parentElement;
+    if (!parent || parent === documentRef.body) break;
+
+    const introducesAmbiguity = Array.from(parent.children).some(
+      (sibling) => sibling !== node && (looksLikeUnrelatedSection(sibling) || containsNestedPriceOrClaim(sibling))
+    );
+    if (introducesAmbiguity) break;
+
+    node = parent;
+  }
+  return node;
+}
+
 // ---------- Claim proximity ----------
 // Combined hop-distance from `el` up to its nearest ancestor shared with
 // `anchorEl`, plus the anchor's own hop-distance to that same ancestor.

@@ -486,3 +486,82 @@ response to that, not just another patch.
   the exact opposite of what the code actually does (a leftover from
   before the null-currency fix two rounds ago).
 - **The test suite grew to 71 checks.**
+
+### Sixth hardening pass
+
+A sixth adversarial review found that three of the previous round's real
+fixes each had the same underlying gap surviving one layer below or
+beside where the fix was applied — plus one genuinely new finding about
+unbounded page-controlled metadata. All reproduced before fixing.
+
+- **The offers-array ambiguity check had the exact same rounding and
+  currency-blindness bug the candidate-tie fix had already closed one
+  layer up.** A single `Product`'s own `offers` array could contain two
+  offers at `KWD 1.250` and `KWD 1.251` — genuinely different prices —
+  and the ambiguity check's `toFixed(2)` rounding collapsed them into
+  "the same," same failure mode as the candidate-tie bug from two rounds
+  ago, just one level lower in the same JSON-LD object. Currency wasn't
+  compared at all (`AUD 100` and `USD 100` counted as identical), and
+  `lowPrice`/`priceSpecification.price` weren't included in the check at
+  all, so two conflicting non-exact offers could slip through untested.
+  Extracted into `offersAreAmbiguous()` in `shared.js` — a full identity
+  key (price to 6 decimals, currency, exact-vs-range type), directly
+  testable with plain data, mirroring the same fix already applied to
+  candidate-tie detection.
+- **The claim-proximity threshold still accepted a shallow unrelated
+  promo.** The hop-distance threshold (≤3) was tuned against a fixture
+  that happened to include an extra wrapper `<div>` around the price;
+  removing that one wrapper reduced the combined distance to exactly 3,
+  right at the threshold, and the unrelated `<aside class="promo">`'s
+  claim was accepted again. Rather than retune the number (which trades
+  one failure mode for another — too tight starts rejecting legitimately
+  wrapped pairs), replaced the primary mechanism entirely with what the
+  review specifically suggested: common-container semantics. Instead of
+  measuring distance or counting signals, container expansion now stops
+  the instant it would include a sibling that isn't itself part of the
+  claim (a direct `<del>`, or a was/RRP-styled leaf) but wraps a
+  price-like element nested somewhere inside it — which correctly
+  distinguishes "the was-price itself, sitting right next to the current
+  price" from "an unrelated section that happens to contain a price
+  somewhere inside," regardless of naming, counting, or distance.
+  `proximityHops()` remains as a secondary layer on top, not the primary
+  gate anymore. Verified against the reviewer's exact minimal
+  reproduction (no wrapper at all) plus the original wrapped fixture and
+  two legitimate co-located cases.
+- **Structured (JSON-LD/meta) prices could contradict the visible price
+  and still win.** The zero-identity JSON-LD path got visible-price
+  corroboration in the previous round, but every other structured path —
+  a title-matching JSON-LD candidate, `og:price:amount`/
+  `product:price:amount` meta tags, `itemprop="price"` — could return a
+  price with no check against what's actually shown at all, plausible on
+  variant pages where OG metadata reflects the default variant while a
+  different one is selected. Added one general invariant applied in
+  `run()` to every structured result, not just the zero-identity case: if
+  a credible visible price exists and materially disagrees with the
+  structured one, the structured result is discarded and detection falls
+  through to the visibility-aware DOM watcher instead of silently
+  trusting invisible metadata. Also closed a related gap: the
+  `itemprop="price"` fallback didn't check whether the matched element
+  was actually visible, so a hidden stale/inactive variant's microdata
+  could beat the genuinely displayed price.
+- **Page-controlled image metadata was unbounded and unused.** `image`
+  (from JSON-LD or `og:image`) was persisted on every observation but
+  never displayed anywhere in the popup or history UI — pure
+  unnecessary attack surface. A hostile page could supply an enormous
+  string or a large `data:` URL, and since history and metadata are
+  written together in one `chrome.storage.local.set()` call, an
+  oversized metadata value could push the whole write over quota and
+  block the real observation from being recorded too. Removed entirely
+  rather than bounded, since there's no actual use for it to preserve.
+- **Extracted the container-scoping logic into `shared.js`** alongside
+  the JSON-LD selection logic from the previous round —
+  `looksLikeUnrelatedSection()`, `isClaimLeaf()`,
+  `containsNestedPriceOrClaim()`, and `findLocalContainer()` are all now
+  pure/DOM-fixture-testable functions rather than buried in content.js's
+  closure, continuing the same response to the repeated critique that
+  source-pattern tests can't prove detection behavior.
+- **The test suite grew to 83 checks**, including real behavioral tests
+  for every fixed scenario in this round — reproducing the reviewer's
+  exact minimal claim-scoping case, the three-decimal-currency and
+  cross-currency offer conflicts, and structural checks for the
+  disagreement invariant, itemprop visibility, and image removal.

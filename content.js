@@ -73,21 +73,11 @@
     if (!offers) return null;
     const list = Array.isArray(offers) ? offers : [offers];
 
-    // A Product with multiple offers at genuinely different exact prices
-    // (e.g. size/color variants each priced separately) is ambiguous from
-    // JSON-LD alone — there's no reliable way to tell which variant
-    // corresponds to what's actually shown on this specific page.
-    // Confidently picking the first one risks silently tracking the
-    // wrong variant's price; rejecting is safer than guessing.
-    const distinctExactPrices = new Set(
-      list
-        .map((o) => o.price)
-        .filter((p) => p !== undefined && p !== null && p !== "")
-        .map((p) => parseStructuredPrice(String(p)))
-        .filter((p) => p != null)
-        .map((p) => p.toFixed(2))
-    );
-    if (distinctExactPrices.size > 1) return null;
+    // offersAreAmbiguous() comes from shared.js — extracted there so this
+    // check (which just had a real bug: rounding collapsed three-decimal
+    // currency prices together, and currency wasn't compared at all) can
+    // be exercised directly with plain data.
+    if (offersAreAmbiguous(list, inferCurrencyFromDomain())) return null;
 
     for (const offer of list) {
       // An exact `price` is a real, displayed price for this offer. A
@@ -194,7 +184,6 @@
     const rawId = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
     return {
       title: (p.name || document.title || "").trim().slice(0, 140),
-      image: firstImage(p.image),
       productKey: rawId ? `id:${sanitizeIdForKey(rawId)}` : `name:${normalize(p.name || document.title)}`,
       price: priceInfo.price,
       currency: priceInfo.currency,
@@ -207,13 +196,6 @@
       // No anchor here means no claim detected, not a global guess.
       claimedWasPrice: findClaimedWasPrice(null),
     };
-  }
-
-  function firstImage(image) {
-    if (!image) return null;
-    if (typeof image === "string") return image;
-    if (Array.isArray(image)) return typeof image[0] === "string" ? image[0] : image[0]?.url || null;
-    return image.url || null;
   }
 
   // normalize() comes from shared.js.
@@ -254,11 +236,13 @@
 
     // itemprop="price" is far riskier — listing/search pages often contain
     // many of these (one per result card). Only trust it when: the page
-    // declares itself a product page via og:type, AND there's exactly one
-    // match on the page (so we're not grabbing the first of many cards).
+    // declares itself a product page via og:type, there's exactly one
+    // match on the page (so we're not grabbing the first of many cards),
+    // AND that element is actually visible — a hidden stale/inactive
+    // variant panel's microdata shouldn't be trusted over what's shown.
     if (isDeclaredProductPage) {
       const itemPropEls = document.querySelectorAll('[itemprop="price"]');
-      if (itemPropEls.length === 1) {
+      if (itemPropEls.length === 1 && isVisible(itemPropEls[0])) {
         // The microdata `content` attribute (when present) is the
         // machine-readable structured value per the microdata spec — a
         // plain decimal, same as JSON-LD/meta. Falling back to the
@@ -340,60 +324,8 @@
 
   // ---------- 1c. Claimed "was"/RRP price ----------
 
-  // Common naming conventions for "a different section, not this
-  // product's own content" — recommendation widgets, related-item rails,
-  // upsell carousels. Not exhaustive (no fixed list of class names ever
-  // is), but real e-commerce markup overwhelmingly uses recognizable
-  // naming for these sections, and this is checked alongside the
-  // signal-count heuristic below rather than relied on alone.
-  const UNRELATED_SECTION_PATTERN = /recommend|related|similar|carousel|suggest|cross-?sell|upsell|also-?(bought|like)|you-?may-?also/;
-
-  function looksLikeUnrelatedSection(el) {
-    const flag = `${el.className || ""} ${el.id || ""}`.toLowerCase();
-    return UNRELATED_SECTION_PATTERN.test(flag);
-  }
-
-  // Counts elements that look like a price signal — current-price-styled
-  // or an explicit strikethrough/comparison price — within a container.
-  // One product's own block typically has at most two: its current price
-  // and, sometimes, one "was" price. A container whose count grows past
-  // that has likely swept in another product's price information too.
-  function countPriceSignals(container) {
-    const priceClassNodes = container.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
-    const strikeNodes = container.querySelectorAll("del, s, strike");
-    return new Set([...priceClassNodes, ...strikeNodes]).size;
-  }
-
-  // Walks up from a price element toward a container that plausibly
-  // represents "this product's own block." Kept as a coarse OUTER bound —
-  // it still avoids scanning an entire huge page — but is no longer the
-  // primary safety mechanism. It was found to still admit an unrelated
-  // sibling in perfectly ordinary markup (a generically-named `<aside
-  // class="promo">` isn't caught by any class-name pattern, and a page
-  // with exactly one current price and one unrelated comparison price
-  // elsewhere numerically looks identical to one product's own current+
-  // was pair under a pure signal-count check). The real gate is now
-  // proximityHops() below, which measures actual DOM distance rather than
-  // guessing from naming conventions or counts.
-  function findLocalContainer(el, maxLevels = 8) {
-    let node = el;
-    for (let i = 0; i < maxLevels; i++) {
-      const parent = node.parentElement;
-      if (!parent || parent === document.body) break;
-
-      const hasUnrelatedSibling = Array.from(parent.children).some(
-        (sibling) => sibling !== node && looksLikeUnrelatedSection(sibling)
-      );
-      if (hasUnrelatedSibling) break;
-
-      if (countPriceSignals(parent) > 2) break;
-
-      node = parent;
-    }
-    return node;
-  }
-
-  // proximityHops() comes from shared.js.
+  // looksLikeUnrelatedSection(), isClaimLeaf(), containsNestedPriceOrClaim(),
+  // and findLocalContainer() come from shared.js.
 
   // Maximum combined hop-distance allowed between the current-price
   // anchor and a candidate claim before it's rejected as too far to
@@ -422,7 +354,7 @@
   // detection at all rather than guessing across the whole page.
   function findClaimedWasPrice(anchorEl) {
     if (!anchorEl) return null;
-    const scopeRoot = findLocalContainer(anchorEl);
+    const scopeRoot = findLocalContainer(anchorEl, document);
 
     // Prefer genuine <del>/<s>/<strike> markup — an explicit, unambiguous
     // semantic signal — but score every candidate (from both signal
@@ -548,11 +480,9 @@
     const title =
       document.querySelector('meta[property="og:title"]')?.content ||
       document.title;
-    const image = document.querySelector('meta[property="og:image"]')?.content || null;
 
     return {
       title: (title || "").trim().slice(0, 140),
-      image,
       productKey: `name:${normalize(title)}`,
       price,
       currency,
@@ -650,7 +580,15 @@
       [key]: trimmed,
       [mKey]: {
         title: product.title,
-        image: product.image,
+        // Deliberately not storing product.image: it's page-controlled
+        // (from JSON-LD or og:image), unbounded in length, and isn't
+        // displayed anywhere in the popup or history UI — pure
+        // unnecessary attack surface. A hostile page could otherwise
+        // supply an enormous string or a large data: URL, and since
+        // history and metadata are written in the same
+        // chrome.storage.local.set() call, an oversized metadata value
+        // could push the whole write over quota and block the actual
+        // observation from being recorded too.
         url: location.href,
         lastSeen: now,
       },
@@ -925,12 +863,40 @@
 
   // ---------- 4. Run ----------
 
+  // Checks any structured-data price (JSON-LD or meta-tag derived)
+  // against the page's own primary VISIBLE price. Structured metadata can
+  // be stale, or represent a different variant than the one currently
+  // selected/displayed (a common case: og:price reflects the default
+  // variant while the shopper has picked a different size/color). A
+  // credible visible price that materially disagrees is treated as
+  // grounds to distrust the structured result entirely — not to silently
+  // prefer invisible metadata over what the page is actually showing.
+  // Tolerance allows for minor rounding/formatting noise (e.g. a cent of
+  // difference from currency conversion display quirks) without treating
+  // it as a real conflict.
+  function disagreesWithVisiblePrice(structuredPrice) {
+    const featured = pickBestPriceElement(findPriceElements());
+    if (!featured) return false; // nothing visible to check against — trust structured data
+    const visiblePrice = extractPriceFromText(featured.textContent);
+    if (visiblePrice == null) return false;
+    const tolerance = Math.max(0.02, structuredPrice * 0.02);
+    return Math.abs(structuredPrice - visiblePrice) > tolerance;
+  }
+
   async function run() {
     document.getElementById("price-ledger-badge-host")?.remove();
 
     let product = detectFromJsonLd();
     if (!product) {
       product = detectFromMeta();
+    }
+    if (product && disagreesWithVisiblePrice(product.price)) {
+      // The structured price doesn't match what's actually shown — don't
+      // write it automatically. Fall through to the DOM-based watcher,
+      // which reads the currently visible price directly rather than
+      // resolving the conflict in favor of (possibly stale or
+      // wrong-variant) invisible metadata.
+      product = null;
     }
     if (product) {
       stopDomPriceWatcher();

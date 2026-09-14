@@ -359,8 +359,75 @@ test("genuine duplicate candidates (identical in every way) are still accepted �
   assert(result !== null, "identical duplicate JSON-LD entries (same name, price, currency) should still be accepted");
 });
 
-console.log("\nproximityHops — behavioral tests against real DOM fixtures (jsdom)");
-test("an unrelated sibling section's claim is rejected even when generically named (5th round: <aside class='promo'>)", () => {
+console.log("\noffersAreAmbiguous — behavioral tests (6th adversarial review round: ambiguity survived one layer below the candidate-tie fix)");
+test("two offers within ONE Product at 1.250 vs 1.251 KWD are ambiguous (rounding-collapse regression)", () => {
+  const ambiguous = offersAreAmbiguous([{ price: "1.250", priceCurrency: "KWD" }, { price: "1.251", priceCurrency: "KWD" }], "USD");
+  assert.strictEqual(ambiguous, true, "1.250 and 1.251 KWD must not be collapsed into 'the same offer' by 2-decimal rounding");
+});
+test("two offers within ONE Product at the same number but different currencies are ambiguous", () => {
+  const ambiguous = offersAreAmbiguous([{ price: "100", priceCurrency: "AUD" }, { price: "100", priceCurrency: "USD" }], "USD");
+  assert.strictEqual(ambiguous, true, "AUD 100 and USD 100 are not the same offer just because the numbers match");
+});
+test("two conflicting lowPrice offers (non-exact) are ambiguous — not just exact-price offers", () => {
+  const ambiguous = offersAreAmbiguous([{ lowPrice: "50", priceCurrency: "AUD" }, { lowPrice: "80", priceCurrency: "AUD" }], "AUD");
+  assert.strictEqual(ambiguous, true, "conflicting non-exact offers must be caught too, not just conflicting exact prices");
+});
+test("a single genuine offer is not ambiguous", () => {
+  const ambiguous = offersAreAmbiguous([{ price: "19.99", priceCurrency: "AUD" }], "AUD");
+  assert.strictEqual(ambiguous, false);
+});
+test("identical duplicate offers within one Product are not ambiguous", () => {
+  const ambiguous = offersAreAmbiguous([{ price: "19.99", priceCurrency: "AUD" }, { price: "19.99", priceCurrency: "AUD" }], "AUD");
+  assert.strictEqual(ambiguous, false, "genuinely identical duplicate offers shouldn't be flagged as a conflict");
+});
+
+console.log("\nfindLocalContainer — behavioral tests against real DOM fixtures (jsdom)");
+// This replaces reliance on proximityHops' distance threshold as the
+// PRIMARY defense — a 6th adversarial review round found that threshold
+// (<=3 hops) still accepted an unrelated <aside class="promo"> claim when
+// the price had no wrapper div around it (price and aside both direct
+// children of <main> — combined distance exactly 3, right at the
+// boundary). findLocalContainer's ambiguity-based scoping is the real
+// fix; proximityHops remains as a secondary layer below.
+test("an unrelated sibling section's claim is rejected in the EXACT minimal reproduction (no wrapper div — 6th round regression)", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><main><span class="price">$50</span><aside class="promo"><del>$100</del></aside></main></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const container = findLocalContainer(anchor, doc);
+  assert(!container.querySelector("del"), "the unrelated aside's claim must not be reachable from the resolved container");
+});
+test("an unrelated sibling section's claim is still rejected with an extra wrapper div (the original 5th-round fixture)", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><main><div id="product"><span class="price">$50</span></div><aside class="promo"><del>$100</del></aside></main></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const container = findLocalContainer(anchor, doc);
+  assert(!container.querySelector("del"), "the unrelated aside's claim must not be reachable from the resolved container");
+});
+test("a genuinely co-located claim (direct sibling) is still found", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><div id="main-product"><span class="price">$50</span><del>$100</del></div></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const container = findLocalContainer(anchor, doc);
+  assert(container.querySelector("del"), "a claim that's a direct sibling of the price should still be found");
+});
+test("a realistic nested price-container pattern (price and was-price each in their own wrapper) still passes", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><div id="product-details"><div class="price-container"><div class="price">$50</div><div class="was-price">$100</div></div></div></body></html>`
+  );
+  const doc = dom.window.document;
+  const anchor = doc.querySelector(".price");
+  const container = findLocalContainer(anchor, doc);
+  assert(container.querySelector(".was-price"), "a legitimately nested was-price should still be found");
+});
+
+console.log("\nproximityHops — secondary defense-in-depth layer (behavioral tests)");
+test("an unrelated sibling section's claim is far by hop-distance too, once a wrapper is present", () => {
   const dom = new JSDOM(
     `<!DOCTYPE html><html><body><main><div id="product"><span class="price">$50</span></div><aside class="promo"><del>$100</del></aside></main></body></html>`
   );
@@ -402,6 +469,27 @@ test("price and claim detection both check element visibility", () => {
   assert(/function isVisible\(/.test(contentSrc), "isVisible() appears to have been removed");
   const findPriceElementsBlock = contentSrc.slice(contentSrc.indexOf("function findPriceElements"), contentSrc.indexOf("function findPriceElements") + 800);
   assert(/isVisible\(el\)/.test(findPriceElementsBlock), "findPriceElements no longer filters out hidden candidates");
+});
+test("structured (JSON-LD/meta) prices are checked against the visible price before being trusted (6th round: OG/microdata bypassed corroboration entirely)", () => {
+  assert(
+    /function disagreesWithVisiblePrice/.test(contentSrc),
+    "disagreesWithVisiblePrice appears to have been removed — structured data could again silently override a materially different visible price"
+  );
+  assert(
+    /disagreesWithVisiblePrice\(product\.price\)/.test(contentSrc),
+    "run() should check every structured detection result against the visible price, not just the zero-identity JSON-LD case"
+  );
+});
+test("the itemprop=\"price\" fallback requires the matched element to be visible", () => {
+  const anchorIdx = contentSrc.indexOf('querySelectorAll(\'[itemprop="price"]\')');
+  assert(anchorIdx !== -1, "couldn't locate the itemprop querySelectorAll call at all");
+  const itemPropBlock = contentSrc.slice(anchorIdx, anchorIdx + 400);
+  assert(/isVisible\(itemPropEls\[0\]\)/.test(itemPropBlock), "a hidden stale/inactive itemprop price could again beat the visible current price");
+});
+
+console.log("\nStructural check — unused page-controlled image metadata no longer persisted");
+test("product.image is never written to storage", () => {
+  assert(!/image: product\.image/.test(contentSrc), "product.image is being persisted again — it was removed because it's unused in the UI and was unbounded page-controlled data (a hostile page could supply a huge data: URL)");
 });
 
 console.log("\nStructural check — storage key length bounding");
