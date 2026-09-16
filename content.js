@@ -80,6 +80,10 @@
     if (offersAreAmbiguous(list, inferCurrencyFromDomain())) return null;
 
     for (const offer of list) {
+      // Same guard as offersAreAmbiguous() above — a malformed entry
+      // (null, a string, anything not a plain object) shouldn't crash
+      // detection outright.
+      if (!offer || typeof offer !== "object") continue;
       // An exact `price` is a real, displayed price for this offer. A
       // `lowPrice` (from an AggregateOffer, e.g. across sellers or
       // variants) or a `priceSpecification.price` is a range floor or
@@ -282,17 +286,18 @@
     "www.woolworths.com.au": '[class*="product-price_component_price-lead"]',
   };
 
-  // display:none, visibility:hidden, or a fully collapsed layout (zero
-  // client rects — catches display:none on an ancestor too) all mean
-  // "not what the user is actually looking at." A hidden responsive
-  // layout variant, an inactive carousel slide, or a stale variant panel
-  // could otherwise outrank the genuinely visible price just by having
-  // larger font-size in its own (unrendered) styling.
+  // isVisible() stays here (rather than in shared.js with the other
+  // extracted detection helpers) because its getClientRects() check can't
+  // be meaningfully tested under jsdom anyway — jsdom has no layout
+  // engine, so client rects are always empty regardless of real
+  // visibility. See the test suite's notes on this same limitation.
   function isVisible(el) {
     const style = getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
     return el.getClientRects().length > 0;
   }
+
+  // isStruckThrough() comes from shared.js.
 
   function findPriceElements() {
     const looksLikePrice = /(?:\$|£|€)\s?\d/;
@@ -300,6 +305,7 @@
     const candidates = [];
     for (const el of nodes) {
       if (!isVisible(el)) continue;
+      if (isStruckThrough(el)) continue;
       const text = el.textContent.trim();
       if (!looksLikePrice.test(text) || text.length > 24) continue;
       const flag = `${el.className} ${el.id}`.toLowerCase();
@@ -879,7 +885,14 @@
     if (!featured) return false; // nothing visible to check against — trust structured data
     const visiblePrice = extractPriceFromText(featured.textContent);
     if (visiblePrice == null) return false;
-    const tolerance = Math.max(0.02, structuredPrice * 0.02);
+    // A flat 2-cent tolerance, not a percentage of price — a percentage
+    // tolerance let a $1,000 item disagree by $19 and still count as
+    // "agreeing," which isn't rounding noise, it's an economically
+    // meaningful difference that could be a real variant, a member price,
+    // or an actual new low being masked. 2 cents comfortably absorbs
+    // genuine formatting/rounding quirks without absorbing anything that
+    // actually matters.
+    const tolerance = 0.02;
     return Math.abs(structuredPrice - visiblePrice) > tolerance;
   }
 

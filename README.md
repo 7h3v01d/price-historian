@@ -565,3 +565,57 @@ unbounded page-controlled metadata. All reproduced before fixing.
   exact minimal claim-scoping case, the three-decimal-currency and
   cross-currency offer conflicts, and structural checks for the
   disagreement invariant, itemprop visibility, and image removal.
+
+### Seventh hardening pass
+
+A seventh adversarial review confirmed all four sixth-round fixes held,
+then found three new integrity issues plus one crash bug, none related to
+the previous round's specific fixes — a sign the obvious classes of bug in
+this detection logic are largely exhausted and reviews are now finding
+narrower, more specific gaps. All reproduced before fixing.
+
+- **Non-Latin product titles all collapsed to the same identity.**
+  `normalize()`'s fallback identity (used when no SKU/GTIN is available)
+  stripped every character outside `[a-z0-9]`, meaning any title with no
+  ASCII-representable content — Japanese, Chinese, Korean, Cyrillic,
+  Arabic — produced an empty string. Every such product ended up sharing
+  the exact same storage key, silently merging their histories (a
+  reproduced case: two different Japanese products, a ¥80,000 TV and a
+  ¥30,000 camera, would share one history, with the camera's price
+  appearing as a fictional new low for the TV). Fixed by falling back to
+  a bounded hash of the actual title only when the ASCII slug would
+  otherwise be empty — chosen specifically to leave every
+  ASCII-representable title's behavior completely unchanged, since a
+  naive "always hash" fix would have silently orphaned every
+  already-tracked product's history under a new key.
+- **A semantic `<del>` price could still become the recorded current
+  price.** A comment claimed struck-through prices were already excluded
+  from current-price detection, but the actual exclusion only matched
+  was/rrp/strike/compare/save *keyword text* in a className or id — never
+  the real `<del>`/`<s>`/`<strike>` tag or CSS `text-decoration-line`.
+  `<del class="price">$100</del>` has a class that's literally just
+  "price," containing none of those keywords, so it sailed through as a
+  normal candidate — and once accepted as "the visible price," it could
+  also cause the structured-vs-visible disagreement check (added last
+  round specifically to catch bad data) to reject the *correct*
+  structured price in favor of the wrong struck-through one. Added
+  `isStruckThrough()`, checking both the semantic tag/ancestor and
+  computed `text-decoration-line`, to the current-price candidate filter.
+- **The structured-vs-visible disagreement tolerance was a percentage,
+  not an absolute amount.** 2% of price meant a $1,000 item could disagree
+  by $19 and still count as "agreeing" — not rounding noise, an
+  economically meaningful difference that could mask a real new low or
+  conflate two different variants. Replaced with a small flat tolerance
+  (2 cents) that comfortably absorbs genuine formatting noise without
+  absorbing anything that actually matters.
+- **A malformed JSON-LD offers array could crash detection outright.** A
+  `null` or non-object entry in a `Product`'s `offers` array (a real
+  possibility with quirky or malformed retailer schemas) threw an
+  uncaught `TypeError` reading `.price` off it, aborting detection for
+  the whole page. Both `offersAreAmbiguous()` and the offer-selection
+  loop now skip anything that isn't a plain object rather than crash.
+- **Extracted `isStruckThrough()` into `shared.js`**, directly testable
+  against jsdom fixtures (unlike `isVisible()`, which stays in
+  `content.js` — its `getClientRects()` check can't be meaningfully
+  tested under jsdom's layout-less environment anyway).
+- **The test suite grew to 92 checks.**

@@ -14,12 +14,42 @@
 // corroborating price); this owns the pure decision once that data is
 // already collected.
 
+// A small, fast, non-cryptographic string hash (djb2 variant). Used only
+// to give different Unicode strings different bounded identifiers for
+// storage-key purposes — not for anything security-sensitive, so a
+// lightweight 32-bit hash is entirely sufficient (collision risk between
+// two different non-Latin product titles tracked by one person is
+// astronomically low at this scale).
+function hashString(str) {
+  let hash = 5381;
+  for (let i = 0; i < str.length; i++) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) | 0;
+  }
+  return (hash >>> 0).toString(36);
+}
+
 function normalize(str) {
-  return (str || "")
+  const s = (str || "").trim();
+  const asciiSlug = s
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
     .slice(0, 80);
+  // Unchanged behavior when the title has any ASCII-representable
+  // content — this matters for backward compatibility: changing the
+  // output format for titles that already produce a real slug would
+  // silently orphan every previously-tracked product's history under a
+  // new key.
+  if (asciiSlug) return asciiSlug;
+  // A title with no ASCII-representable characters at all (Japanese,
+  // Chinese, Korean, Cyrillic, Arabic, etc.) used to collapse to an empty
+  // string here — meaning EVERY such title produced the exact same
+  // storage key, silently merging unrelated products' histories together
+  // (a ¥80,000 TV and a ¥30,000 camera could end up sharing one history,
+  // with the camera's price appearing as a fictional new low for the
+  // TV). Falls back to a hash of the actual title so different non-Latin
+  // titles get different identities instead of all merging into one.
+  return `x${hashString(s.toLowerCase())}`;
 }
 
 // A rough, deliberately simple similarity check — not fuzzy-matching for
@@ -116,6 +146,11 @@ function selectBestJsonLdCandidate(candidates, pageTitle) {
 function offersAreAmbiguous(list, currencyFallback) {
   const offerIdentities = new Set();
   for (const offer of list) {
+    // Malformed/quirky JSON-LD (a null entry, a string, anything that
+    // isn't a plain object) shouldn't be able to abort detection outright
+    // with an uncaught exception — that's a page-level data quality
+    // issue, not something worth crashing over. Just skip it.
+    if (!offer || typeof offer !== "object") continue;
     const hasExactPrice = offer.price !== undefined && offer.price !== null && offer.price !== "";
     const rawPrice = offer.price ?? offer.lowPrice ?? offer?.priceSpecification?.price;
     if (rawPrice === undefined || rawPrice === null || rawPrice === "") continue;
@@ -211,6 +246,24 @@ function findLocalContainer(el, documentRef, maxLevels = 8) {
     node = parent;
   }
   return node;
+}
+
+// True if `el` is a semantic strikethrough element (<del>/<s>/<strike>,
+// or nested inside one), or has line-through applied via CSS. A prior
+// version's comment claimed struck-through prices were already excluded
+// from current-price detection, but the actual exclusion only matched
+// was/rrp/strike/compare/save KEYWORD TEXT in a className or id — it
+// never checked the real semantic tag or computed style, so
+// `<del class="price">$100</del>` sailed straight through as a normal
+// current-price candidate (its class is literally "price", containing
+// none of those keywords). Some stores also apply strikethrough purely
+// via CSS (text-decoration-line) on an otherwise plain element rather
+// than semantic markup, which this also catches.
+function isStruckThrough(el) {
+  if (el.closest && el.closest("del, s, strike")) return true;
+  const style = getComputedStyle(el);
+  const decoration = style.textDecorationLine || style.textDecoration || "";
+  return decoration.includes("line-through");
 }
 
 // ---------- Claim proximity ----------

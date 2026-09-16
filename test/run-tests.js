@@ -380,6 +380,33 @@ test("identical duplicate offers within one Product are not ambiguous", () => {
   const ambiguous = offersAreAmbiguous([{ price: "19.99", priceCurrency: "AUD" }, { price: "19.99", priceCurrency: "AUD" }], "AUD");
   assert.strictEqual(ambiguous, false, "genuinely identical duplicate offers shouldn't be flagged as a conflict");
 });
+test("a malformed offers array (null entries, non-objects) doesn't crash detection (7th round)", () => {
+  assert.doesNotThrow(() => {
+    offersAreAmbiguous([null, { price: "10", priceCurrency: "AUD" }], "AUD");
+  }, "a null array entry should be skipped, not thrown on");
+  assert.doesNotThrow(() => {
+    offersAreAmbiguous(["not an object", undefined, { price: "10", priceCurrency: "AUD" }], "AUD");
+  }, "non-object entries should be skipped, not thrown on");
+  const result = offersAreAmbiguous([null, { price: "10", priceCurrency: "AUD" }], "AUD");
+  assert.strictEqual(result, false, "one valid offer among malformed entries is not ambiguous");
+});
+
+console.log("\nnormalize() — non-Latin product identity (7th adversarial review round)");
+test("different non-Latin titles no longer collapse to the same identity", () => {
+  const titles = ["テレビ", "カメラ", "电视机", "手机", "Камера", "Телевизор"];
+  const identities = new Set(titles.map(normalize));
+  assert.strictEqual(identities.size, titles.length, "each distinct non-Latin title must produce a distinct identity — the old behavior collapsed all of them to the same empty string, silently merging unrelated products' price histories");
+});
+test("the exact reviewer scenario: テレビ and カメラ are distinct", () => {
+  assert.notStrictEqual(normalize("テレビ"), normalize("カメラ"), "a TV and a camera must never share a product identity");
+});
+test("ASCII titles are completely unaffected (no migration break for already-tracked products)", () => {
+  assert.strictEqual(normalize("Blue Widget"), "blue-widget");
+  assert.strictEqual(normalize("Woolworths Whole Milk"), "woolworths-whole-milk");
+});
+test("the same non-Latin title normalizes identically every time (deterministic, not random)", () => {
+  assert.strictEqual(normalize("テレビ"), normalize("テレビ"));
+});
 
 console.log("\nfindLocalContainer — behavioral tests against real DOM fixtures (jsdom)");
 // This replaces reliance on proximityHops' distance threshold as the
@@ -456,6 +483,39 @@ test("a realistic nested price-container pattern (price and was-price each in th
   const wasEl = doc.querySelector(".was-price");
   const dist = proximityHops(anchor, wasEl);
   assert(dist <= 3, `expected the nested-wrapper claim to still be close enough (<=3 hops), got ${dist}`);
+});
+
+console.log("\nisStruckThrough — behavioral tests against real DOM fixtures (7th adversarial review round)");
+test("a <del class=\"price\"> element is correctly identified as struck-through", () => {
+  const dom = new JSDOM(`<!DOCTYPE html><html><body><del class="price">$100</del><span class="price-current">$80</span></body></html>`);
+  global.getComputedStyle = dom.window.getComputedStyle;
+  const del = dom.window.document.querySelector("del");
+  const span = dom.window.document.querySelector(".price-current");
+  assert.strictEqual(isStruckThrough(del), true, "a <del> with a plain 'price' class (no was/rrp/strike keyword) must still be recognized as struck-through");
+  assert.strictEqual(isStruckThrough(span), false, "the genuine current price must not be flagged");
+});
+test("an element nested inside a <del> is also recognized as struck-through", () => {
+  const dom = new JSDOM(`<!DOCTYPE html><html><body><del><span class="price">$100</span></del></body></html>`);
+  global.getComputedStyle = dom.window.getComputedStyle;
+  const span = dom.window.document.querySelector(".price");
+  assert.strictEqual(isStruckThrough(span), true);
+});
+test("CSS-only line-through (no semantic <del>/<s>/<strike>) is also recognized", () => {
+  const dom = new JSDOM(
+    `<!DOCTYPE html><html><body><span class="price" style="text-decoration-line: line-through;">$100</span></body></html>`
+  );
+  global.getComputedStyle = dom.window.getComputedStyle;
+  const span = dom.window.document.querySelector(".price");
+  assert.strictEqual(isStruckThrough(span), true, "some stores strike through prices via CSS rather than semantic markup");
+});
+
+console.log("\nStructural check — structured-vs-visible tolerance (7th round: 2% permitted a $19 discrepancy on a $1,000 item)");
+test("the disagreement tolerance is a small flat value, not a percentage of price", () => {
+  assert(
+    !/structuredPrice \* 0\.02/.test(contentSrc) && !/Math\.max\(0\.02, structuredPrice/.test(contentSrc),
+    "the tolerance appears to be percentage-based again — a percentage of price let large-value discrepancies (e.g. $19 on a $1,000 item) count as 'agreeing'"
+  );
+  assert(/const tolerance = 0\.02;/.test(contentSrc), "expected a small flat tolerance constant");
 });
 
 console.log("\nStructural checks — content.js-specific corroboration logic (needs live DOM access, can't be exercised with plain data)");
