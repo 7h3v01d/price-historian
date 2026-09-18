@@ -138,5 +138,61 @@ async function migrateLegacyCurrencyData() {
 chrome.runtime.onInstalled.addListener((details) => {
   if (details.reason === "update") {
     migrateLegacyCurrencyData();
+    migrateNameBasedIdentityKeys();
   }
 });
+
+// normalize() was changed to always incorporate a hash of the full
+// Unicode title (not just whatever ASCII survived stripping), and the
+// fallback product key now also incorporates the page's URL path, not
+// just the title — a generic reused title ("Product Details") on two
+// different product pages used to share one identity. Both changes mean
+// every existing name-based storage key computes to a different key than
+// before. Without migrating, every previously tracked name-based product
+// would silently lose its history on update, which is exactly the kind
+// of "just reset everything" failure this extension has otherwise been
+// careful to avoid. This recomputes each product's key from its own
+// stored title and URL and moves the data across, rather than leaving
+// old keys to rot unreferenced.
+async function migrateNameBasedIdentityKeys() {
+  const all = await chrome.storage.local.get(null);
+  const updates = {};
+  const removals = [];
+
+  for (const key of Object.keys(all)) {
+    const match = key.match(/^meta:([^:]+):name:(.+)$/);
+    if (!match) continue;
+    const [, domain, oldSlug] = match;
+    const meta = all[key];
+    if (!meta || typeof meta.title !== "string") continue;
+
+    let pathname = "";
+    try {
+      pathname = meta.url ? new URL(meta.url).pathname : "";
+    } catch {
+      // malformed/missing URL — fall back to title-only identity, same
+      // as buildFallbackProductKey does with an empty pathname
+    }
+
+    const newProductKey = buildFallbackProductKey(meta.title, pathname);
+    const oldProductKey = `name:${oldSlug}`;
+    if (newProductKey === oldProductKey) continue; // already current, or coincidentally unchanged
+
+    const newMetaKey = `meta:${domain}:${newProductKey}`;
+    if (all[newMetaKey] || updates[newMetaKey]) continue; // don't clobber existing data at the destination — leave this one alone rather than risk losing something
+
+    const oldHistoryKey = `history:${domain}:${oldProductKey}`;
+    const newHistoryKey = `history:${domain}:${newProductKey}`;
+
+    updates[newMetaKey] = meta;
+    if (all[oldHistoryKey]) updates[newHistoryKey] = all[oldHistoryKey];
+    removals.push(key, oldHistoryKey);
+  }
+
+  if (Object.keys(updates).length > 0) {
+    await chrome.storage.local.set(updates);
+  }
+  if (removals.length > 0) {
+    await chrome.storage.local.remove(removals);
+  }
+}

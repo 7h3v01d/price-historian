@@ -186,9 +186,10 @@
     const p = candidate._raw;
     const priceInfo = candidate.priceInfo;
     const rawId = p.gtin13 || p.gtin || p.gtin12 || p.gtin8 || p.mpn || p.sku || null;
+    const sanitizedId = rawId ? sanitizeIdForKey(rawId) : null;
     return {
       title: (p.name || document.title || "").trim().slice(0, 140),
-      productKey: rawId ? `id:${sanitizeIdForKey(rawId)}` : `name:${normalize(p.name || document.title)}`,
+      productKey: sanitizedId ? `id:${sanitizedId}` : buildFallbackProductKey(p.name || document.title, location.pathname),
       price: priceInfo.price,
       currency: priceInfo.currency,
       // JSON-LD's Offer schema has no standard "was/RRP" field, and this
@@ -211,7 +212,14 @@
   // long value here, growing storage for no real benefit (these values
   // exist to identify a product, not to hold arbitrary data).
   function sanitizeIdForKey(id) {
-    return String(id).trim().replace(/\s+/g, "-").slice(0, 100);
+    const cleaned = String(id).trim().replace(/\s+/g, "-");
+    if (!cleaned) return null; // whitespace-only input has no meaningful identifier — caller should fall back to name-based identity instead of using an empty "id:" key
+    if (cleaned.length <= 100) return cleaned;
+    // Long IDs: truncating alone risks two different long IDs that
+    // happen to share the same first 100 characters colliding into the
+    // same key. Appending a hash of the FULL (untruncated) value keeps
+    // them distinguishable even after truncation.
+    return `${cleaned.slice(0, 80)}-x${hashString(cleaned)}`;
   }
 
   // Fallback for pages without JSON-LD: meta tags + a scan for itemprop price.
@@ -300,14 +308,20 @@
   // isStruckThrough() comes from shared.js.
 
   function findPriceElements() {
-    const looksLikePrice = /(?:\$|£|€)\s?\d/;
     const nodes = document.querySelectorAll('[class*="price" i], [id*="price" i], [data-testid*="price" i]');
     const candidates = [];
     for (const el of nodes) {
       if (!isVisible(el)) continue;
       if (isStruckThrough(el)) continue;
       const text = el.textContent.trim();
-      if (!looksLikePrice.test(text) || text.length > 24) continue;
+      if (text.length > 24) continue;
+      // Uses the same currency-aware extraction as everywhere else,
+      // rather than a separate lightweight "does this look like a price"
+      // regex — an earlier version's existence check only recognized
+      // $/£/€, so a page showing only a ¥/₹/₩ price (or an ISO code like
+      // "CHF 80.00") had no candidates AT ALL, silently disabling this
+      // detector for those currencies.
+      if (extractPriceFromText(text) == null) continue;
       const flag = `${el.className} ${el.id}`.toLowerCase();
       // Skip strikethrough "was" prices, RRPs, and per-unit ($/100g) prices —
       // we want the actual current total price, not a comparison figure.
@@ -489,7 +503,7 @@
 
     return {
       title: (title || "").trim().slice(0, 140),
-      productKey: `name:${normalize(title)}`,
+      productKey: buildFallbackProductKey(title, location.pathname),
       price,
       currency,
       claimedWasPrice: findClaimedWasPrice(anchorEl || null),
@@ -880,19 +894,17 @@
   // Tolerance allows for minor rounding/formatting noise (e.g. a cent of
   // difference from currency conversion display quirks) without treating
   // it as a real conflict.
-  function disagreesWithVisiblePrice(structuredPrice) {
+  function disagreesWithVisiblePrice(structuredPrice, currency) {
     const featured = pickBestPriceElement(findPriceElements());
     if (!featured) return false; // nothing visible to check against — trust structured data
     const visiblePrice = extractPriceFromText(featured.textContent);
     if (visiblePrice == null) return false;
-    // A flat 2-cent tolerance, not a percentage of price — a percentage
-    // tolerance let a $1,000 item disagree by $19 and still count as
-    // "agreeing," which isn't rounding noise, it's an economically
-    // meaningful difference that could be a real variant, a member price,
-    // or an actual new low being masked. 2 cents comfortably absorbs
-    // genuine formatting/rounding quirks without absorbing anything that
-    // actually matters.
-    const tolerance = 0.02;
+    // toleranceForCurrency() comes from shared.js — a flat tolerance
+    // implicitly assumed a 2-decimal currency, which is far too loose for
+    // 3-decimal currencies (19 fils on a KWD price is a real difference,
+    // not rounding noise) and not quite right for 0-decimal currencies
+    // like JPY either.
+    const tolerance = toleranceForCurrency(currency);
     return Math.abs(structuredPrice - visiblePrice) > tolerance;
   }
 
@@ -903,7 +915,7 @@
     if (!product) {
       product = detectFromMeta();
     }
-    if (product && disagreesWithVisiblePrice(product.price)) {
+    if (product && disagreesWithVisiblePrice(product.price, product.currency)) {
       // The structured price doesn't match what's actually shown — don't
       // write it automatically. Fall through to the DOM-based watcher,
       // which reads the currently visible price directly rather than

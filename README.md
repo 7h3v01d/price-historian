@@ -619,3 +619,64 @@ narrower, more specific gaps. All reproduced before fixing.
   `content.js` — its `getClientRects()` check can't be meaningfully
   tested under jsdom's layout-less environment anyway).
 - **The test suite grew to 92 checks.**
+
+### Eighth hardening pass
+
+An eighth adversarial review confirmed the seventh round's fixes held —
+and then found the seventh round's non-Latin identity fix had its own
+gap, plus two more findings, one of them verified in real Chromium
+rather than jsdom. All reproduced before fixing.
+
+- **Mixed-script titles still collided.** The seventh round's fix
+  correctly gave different identities to titles with NO ascii content at
+  all ("テレビ" vs "カメラ"), but returned the bare ASCII slug whenever
+  *any* ASCII survived — so "Sony テレビ" and "Sony カメラ" both reduced
+  to "sony" and merged anyway. This is arguably the more common
+  real-world case: international storefronts routinely mix a Latin brand
+  name with a non-Latin product description. Fixed properly this time:
+  identity now always depends on a hash of the *complete* title, with the
+  ASCII portion kept only as a human-readable prefix, never as what makes
+  two titles equal or different. Since this (again) changes the storage
+  key for every name-based product, extended the existing migration in
+  `background.js` to recompute and move each product's data to its new
+  key on update, rather than silently orphaning history a second time.
+- **The visible-price safety net only recognized $/£/€.** A page showing
+  only a ¥, ₹, or ₩ price (or a plain ISO code like "CHF 80.00") had no
+  visible-price candidate at all — which meant the structured-vs-visible
+  disagreement check added two rounds ago silently reported "no conflict"
+  for every such page, regardless of whether the structured price was
+  actually correct. `extractPriceFromText()` now recognizes ¥/￥/₹/₩
+  directly and a whitelisted set of ISO currency codes on either side of
+  the number (gated by a whitelist specifically so "SKU 123" or a size
+  like "XXL 2" doesn't get misread as a price).
+- **CSS line-through inherited from an ancestor wasn't detected** —
+  confirmed in real Chromium, not just jsdom. `<span
+  style="text-decoration-line:line-through"><span
+  class="price">$100</span></span>` renders the inner price visibly
+  struck through, but the inner element's own `getComputedStyle()`
+  reports `textDecorationLine: "none"` — the decoration is drawn by the
+  ancestor and, per how browsers render it, generally can't be
+  "un-struck" by a descendant. `isStruckThrough()` now walks the full
+  ancestor chain rather than checking only the element's own style.
+- **The name-based fallback identity ignored the page's URL entirely.**
+  Two different products sharing a generic, reused title ("Product
+  Details") on different URLs could merge into one history — the DOM
+  watcher's own temporary dedupe key already included
+  `location.pathname` for exactly this reason, but that distinction
+  disappeared once the *persistent* storage key was built from title
+  alone. Added `buildFallbackProductKey()`, combining title and path, and
+  extended the same migration to cover this identity change too.
+- **The structured-vs-visible tolerance assumed a 2-decimal currency.**
+  A flat 2-cent tolerance meant KWD 1.250 vs 1.269 — 19 fils, a real and
+  meaningful difference for a 3-decimal currency — counted as
+  "agreeing." Added `toleranceForCurrency()`: 0.002 for 3-decimal
+  currencies (KWD/BHD/OMR/JOD/TND), 1 for 0-decimal currencies
+  (JPY/KRW, which have no fractional unit at all), 0.02 otherwise.
+- **Two smaller `sanitizeIdForKey()` edge cases**: a whitespace-only
+  identifier used to produce a meaningless empty `id:` key instead of
+  falling back to name-based identity, and two different long
+  identifiers sharing the same first 100 characters could collide on
+  truncation — both fixed (whitespace-only now returns `null` so the
+  caller falls back correctly; long IDs get a hash suffix rather than a
+  naive truncation).
+- **The test suite grew to 113 checks.**

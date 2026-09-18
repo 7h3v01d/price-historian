@@ -391,7 +391,7 @@ test("a malformed offers array (null entries, non-objects) doesn't crash detecti
   assert.strictEqual(result, false, "one valid offer among malformed entries is not ambiguous");
 });
 
-console.log("\nnormalize() — non-Latin product identity (7th adversarial review round)");
+console.log("\nnormalize() — non-Latin AND mixed-script product identity (7th + 8th adversarial review rounds)");
 test("different non-Latin titles no longer collapse to the same identity", () => {
   const titles = ["テレビ", "カメラ", "电视机", "手机", "Камера", "Телевизор"];
   const identities = new Set(titles.map(normalize));
@@ -400,12 +400,34 @@ test("different non-Latin titles no longer collapse to the same identity", () =>
 test("the exact reviewer scenario: テレビ and カメラ are distinct", () => {
   assert.notStrictEqual(normalize("テレビ"), normalize("カメラ"), "a TV and a camera must never share a product identity");
 });
-test("ASCII titles are completely unaffected (no migration break for already-tracked products)", () => {
-  assert.strictEqual(normalize("Blue Widget"), "blue-widget");
-  assert.strictEqual(normalize("Woolworths Whole Milk"), "woolworths-whole-milk");
+test("mixed-script titles sharing an ASCII prefix are distinct (8th round: 'Sony テレビ' vs 'Sony カメラ')", () => {
+  // A 7th-round fix returned the bare ASCII slug whenever any ASCII
+  // survived, which fixed pure non-Latin titles but left this — arguably
+  // more common — international case wide open: both titles reduce to
+  // the ASCII slug "sony" alone if the non-Latin portion is discarded.
+  assert.notStrictEqual(normalize("Sony テレビ"), normalize("Sony カメラ"), "identity must depend on the FULL title, not just whatever ASCII happens to survive");
+  assert.notStrictEqual(
+    normalize("Samsung テレビ 55"),
+    normalize("Samsung モニター 55"),
+    "sharing an ASCII brand name AND a matching number must still not collide"
+  );
 });
-test("the same non-Latin title normalizes identically every time (deterministic, not random)", () => {
+test("the same title normalizes identically every time (deterministic, not random)", () => {
   assert.strictEqual(normalize("テレビ"), normalize("テレビ"));
+  assert.strictEqual(normalize("Sony テレビ"), normalize("Sony テレビ"));
+});
+test("ASCII titles keep a readable prefix (the hash suffix is for uniqueness, not to obscure normal titles)", () => {
+  assert(normalize("Blue Widget").startsWith("blue-widget-"), "an ASCII title should still be recognizable in its own storage key");
+});
+
+console.log("\nbuildFallbackProductKey() — URL path as part of fallback identity (8th round: a generic reused title collided across different product pages)");
+test("the same generic title on two different URL paths produces different identities", () => {
+  const keyA = buildFallbackProductKey("Product Details", "/product/123");
+  const keyB = buildFallbackProductKey("Product Details", "/product/456");
+  assert.notStrictEqual(keyA, keyB, "the same generic title on two different products must not share an identity just because the title text matches");
+});
+test("the same title and path produce the same identity (deterministic)", () => {
+  assert.strictEqual(buildFallbackProductKey("Blue Widget", "/product/123"), buildFallbackProductKey("Blue Widget", "/product/123"));
 });
 
 console.log("\nfindLocalContainer — behavioral tests against real DOM fixtures (jsdom)");
@@ -508,14 +530,70 @@ test("CSS-only line-through (no semantic <del>/<s>/<strike>) is also recognized"
   const span = dom.window.document.querySelector(".price");
   assert.strictEqual(isStruckThrough(span), true, "some stores strike through prices via CSS rather than semantic markup");
 });
+test("line-through inherited from an ANCESTOR is recognized even though the element's own computed style reports 'none' (8th round, reproduced in real Chromium)", () => {
+  const dom = new JSDOM(`<!DOCTYPE html><html><body>
+    <span style="text-decoration-line: line-through;"><span class="price">$100</span></span>
+    <span class="price">$80</span>
+  </body></html>`);
+  global.getComputedStyle = dom.window.getComputedStyle;
+  const prices = dom.window.document.querySelectorAll(".price");
+  assert.strictEqual(isStruckThrough(prices[0]), true, "a price nested inside a struck-through wrapper must be recognized, even though jsdom/Chromium both report the element's OWN computed textDecorationLine as empty");
+  assert.strictEqual(isStruckThrough(prices[1]), false, "the genuine current price outside the wrapper must not be flagged");
+});
 
-console.log("\nStructural check — structured-vs-visible tolerance (7th round: 2% permitted a $19 discrepancy on a $1,000 item)");
-test("the disagreement tolerance is a small flat value, not a percentage of price", () => {
+console.log("\nextractPriceFromText() — international currency support (8th adversarial review round: only $/£/€ were recognized)");
+const currencyCases = [
+  ["$80,000", 80000],
+  ["£80,000", 80000],
+  ["€80,000", 80000],
+  ["¥80,000", 80000],
+  ["₹80,000", 80000],
+  ["₩80,000", 80000],
+  ["CHF 80.00", 80],
+  ["JPY 80000", 80000],
+  ["AUD 19.99", 19.99],
+  ["19.99 EUR", 19.99],
+  ["80,00 €", 80],
+];
+for (const [input, expected] of currencyCases) {
+  test(`extracts "${input}" as ${expected}`, () => {
+    const got = extractPriceFromText(input);
+    assert(got !== null, `expected ${expected}, got null`);
+    assert(Math.abs(got - expected) < 0.001, `expected ${expected}, got ${got}`);
+  });
+}
+test("does not false-positive on non-currency uppercase text near a number", () => {
+  assert.strictEqual(extractPriceFromText("SKU 123"), null);
+  assert.strictEqual(extractPriceFromText("XXL 2"), null);
+});
+
+console.log("\nsanitizeIdForKey() edge cases (8th adversarial review round)");
+test("a whitespace-only ID is rejected rather than producing an empty 'id:' key", () => {
+  assert(/if \(!cleaned\) return null;/.test(contentSrc), "sanitizeIdForKey should return null for a whitespace-only ID so callers fall back to name-based identity");
+});
+test("long IDs that share a truncated prefix get distinguishing hash suffixes", () => {
+  assert(/hashString\(cleaned\)/.test(contentSrc), "long IDs should be hashed rather than naively truncated, to avoid two different long IDs colliding on their shared prefix");
+});
+
+console.log("\ntoleranceForCurrency() — currency-minor-unit-aware disagreement tolerance (7th + 8th adversarial review rounds)");
+test("the tolerance is never percentage-based (7th round: 2% permitted a $19 discrepancy on a $1,000 item)", () => {
   assert(
     !/structuredPrice \* 0\.02/.test(contentSrc) && !/Math\.max\(0\.02, structuredPrice/.test(contentSrc),
     "the tolerance appears to be percentage-based again — a percentage of price let large-value discrepancies (e.g. $19 on a $1,000 item) count as 'agreeing'"
   );
-  assert(/const tolerance = 0\.02;/.test(contentSrc), "expected a small flat tolerance constant");
+});
+test("KWD 1.250 vs 1.269 (19 fils) is flagged as a real disagreement, not rounding noise (8th round)", () => {
+  const tolerance = toleranceForCurrency("KWD");
+  assert(Math.abs(1.25 - 1.269) > tolerance, "a flat 2-cent tolerance would have swallowed this real 19-fils difference");
+});
+test("AUD 100.00 vs 100.01 (1 cent) is within tolerance", () => {
+  const tolerance = toleranceForCurrency("AUD");
+  assert(Math.abs(100.0 - 100.01) <= tolerance);
+});
+test("JPY has no fractional minor unit — a 1-yen difference is within tolerance, 500 yen is not", () => {
+  const tolerance = toleranceForCurrency("JPY");
+  assert(Math.abs(80000 - 80001) <= tolerance);
+  assert(Math.abs(80000 - 80500) > tolerance);
 });
 
 console.log("\nStructural checks — content.js-specific corroboration logic (needs live DOM access, can't be exercised with plain data)");
@@ -536,8 +614,8 @@ test("structured (JSON-LD/meta) prices are checked against the visible price bef
     "disagreesWithVisiblePrice appears to have been removed — structured data could again silently override a materially different visible price"
   );
   assert(
-    /disagreesWithVisiblePrice\(product\.price\)/.test(contentSrc),
-    "run() should check every structured detection result against the visible price, not just the zero-identity JSON-LD case"
+    /disagreesWithVisiblePrice\(product\.price,\s*product\.currency\)/.test(contentSrc),
+    "run() should check every structured detection result against the visible price (with its currency, for minor-unit-aware tolerance), not just the zero-identity JSON-LD case"
   );
 });
 test("the itemprop=\"price\" fallback requires the matched element to be visible", () => {

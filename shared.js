@@ -34,22 +34,33 @@ function normalize(str) {
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "")
-    .slice(0, 80);
-  // Unchanged behavior when the title has any ASCII-representable
-  // content — this matters for backward compatibility: changing the
-  // output format for titles that already produce a real slug would
-  // silently orphan every previously-tracked product's history under a
-  // new key.
-  if (asciiSlug) return asciiSlug;
-  // A title with no ASCII-representable characters at all (Japanese,
-  // Chinese, Korean, Cyrillic, Arabic, etc.) used to collapse to an empty
-  // string here — meaning EVERY such title produced the exact same
-  // storage key, silently merging unrelated products' histories together
-  // (a ¥80,000 TV and a ¥30,000 camera could end up sharing one history,
-  // with the camera's price appearing as a fictional new low for the
-  // TV). Falls back to a hash of the actual title so different non-Latin
-  // titles get different identities instead of all merging into one.
-  return `x${hashString(s.toLowerCase())}`;
+    .slice(0, 60);
+  // Identity now always depends on the hash of the FULL title, not just
+  // whichever ASCII characters happen to survive stripping. A prior
+  // version returned the bare ASCII slug whenever any survived at all —
+  // which fixed titles with NO ascii content (distinct hashes), but left
+  // mixed-script titles fully exposed to the exact same collision:
+  // "Sony テレビ" and "Sony カメラ" both reduce to the ascii slug "sony",
+  // silently merging their histories. International storefronts commonly
+  // mix a Latin brand name with a non-Latin product description, so this
+  // was arguably the more common real-world case, not an edge case. The
+  // ascii prefix is kept purely for readability (a title case a human
+  // skimming storage would recognize) — it is no longer what makes two
+  // titles equal or different; the hash is.
+  const hash = hashString(s.toLowerCase());
+  return (asciiSlug ? `${asciiSlug}-x${hash}` : `x${hash}`).slice(0, 80);
+}
+
+// Builds the fallback product identity (used when no SKU/GTIN is
+// available) from BOTH the title and the page's URL path — title alone
+// isn't reliable identity when a site reuses a generic title across
+// different products ("Product Details" on both /product/123 and
+// /product/456). The DOM watcher's own temporary dedupe key already
+// included location.pathname for exactly this reason, but that
+// distinction previously disappeared once the PERSISTENT storage key was
+// built from title alone.
+function buildFallbackProductKey(title, pathname) {
+  return `name:${normalize(`${title || ""}::${pathname || ""}`)}`;
 }
 
 // A rough, deliberately simple similarity check — not fuzzy-matching for
@@ -248,22 +259,27 @@ function findLocalContainer(el, documentRef, maxLevels = 8) {
   return node;
 }
 
-// True if `el` is a semantic strikethrough element (<del>/<s>/<strike>,
-// or nested inside one), or has line-through applied via CSS. A prior
-// version's comment claimed struck-through prices were already excluded
-// from current-price detection, but the actual exclusion only matched
-// was/rrp/strike/compare/save KEYWORD TEXT in a className or id — it
-// never checked the real semantic tag or computed style, so
-// `<del class="price">$100</del>` sailed straight through as a normal
-// current-price candidate (its class is literally "price", containing
-// none of those keywords). Some stores also apply strikethrough purely
-// via CSS (text-decoration-line) on an otherwise plain element rather
-// than semantic markup, which this also catches.
+// True if `el` is visually struck through — either it's a semantic
+// <del>/<s>/<strike> (or nested inside one), or it (or any ancestor) has
+// CSS line-through applied. Walking the ancestor chain matters: CSS text
+// decoration visually propagates down to descendants, and — per how
+// browsers actually render it — a descendant generally can't un-strike
+// itself from an ancestor's line-through. So `getComputedStyle(el)`
+// alone reports "none" on the descendant even while the browser renders
+// it struck through, because the decoration is drawn by the ancestor,
+// not recorded on the descendant's own computed style. A prior version
+// only checked the element's own computed style and `el.closest()` for
+// semantic tags, which missed exactly this case: a plain wrapper span
+// with `text-decoration-line: line-through` containing a `.price` span
+// with no styling of its own.
 function isStruckThrough(el) {
-  if (el.closest && el.closest("del, s, strike")) return true;
-  const style = getComputedStyle(el);
-  const decoration = style.textDecorationLine || style.textDecoration || "";
-  return decoration.includes("line-through");
+  for (let node = el; node; node = node.parentElement) {
+    if (node.matches && node.matches("del, s, strike")) return true;
+    const style = getComputedStyle(node);
+    const decoration = style.textDecorationLine || style.textDecoration || "";
+    if (decoration.includes("line-through")) return true;
+  }
+  return false;
 }
 
 // ---------- Claim proximity ----------
@@ -390,15 +406,76 @@ function parseStructuredPrice(raw) {
   return Number.isFinite(num) && num > 0 ? num : null;
 }
 
-// Finds a currency-symbol-prefixed amount in arbitrary page text and
-// parses it through parsePriceAmount(). Returns a number, or null if no
+// ISO currency codes worth recognizing directly in page text (CHF 123.45,
+// JPY 80000, 19.99 EUR). Gated by this whitelist rather than matching any
+// 3 uppercase letters next to a number — otherwise "SKU 123" or a size
+// like "XXL 2" could be misread as a price.
+const KNOWN_CURRENCY_CODES = new Set([
+  "USD", "AUD", "NZD", "CAD", "GBP", "EUR", "JPY", "CNY", "INR", "SGD",
+  "HKD", "CHF", "KWD", "BHD", "OMR", "JOD", "TND", "SEK", "NOK", "DKK",
+  "ZAR", "AED", "SAR", "THB", "MYR", "PHP", "IDR", "KRW", "TWD", "MXN",
+  "BRL",
+]);
+
+// Currency symbols worth recognizing beyond the original $/£/€ — ¥ (JPY,
+// also used for CNY) and ￥ (its fullwidth form), ₹ (INR), ₩ (KRW). The
+// original three-symbol-only version meant a page showing only a ¥/₹/₩
+// price had NO candidate price at all, which silently broke the
+// structured-vs-visible disagreement check for those currencies: with no
+// visible candidate found, disagreement detection always reported "no
+// conflict," so a stale or wrong structured price could be trusted with
+// none of the scrutiny 2-symbol markets get.
+const CURRENCY_SYMBOL_CLASS = "\\$£€¥￥₹₩";
+
+// Finds a currency-marked amount (symbol-prefixed, symbol-suffixed, or a
+// known ISO code on either side) in arbitrary page text and parses it
+// through parsePriceAmount(). Returns a number, or null if no
 // plausible/unambiguous price is found — callers should treat null as
 // "no price here," not fall back to guessing.
 function extractPriceFromText(text) {
   if (!text) return null;
-  const match = text.match(/(?:\$|£|€)\s?(\d[\d.,\s]*\d|\d)/);
-  if (!match) return null;
-  return parsePriceAmount(match[1]);
+  const numPattern = "(\\d[\\d.,\\s]*\\d|\\d)";
+
+  let match = text.match(new RegExp(`[${CURRENCY_SYMBOL_CLASS}]\\s?${numPattern}`));
+  if (match) {
+    const num = parsePriceAmount(match[1]);
+    if (num != null) return num;
+  }
+
+  match = text.match(new RegExp(`${numPattern}\\s?[${CURRENCY_SYMBOL_CLASS}]`));
+  if (match) {
+    const num = parsePriceAmount(match[1]);
+    if (num != null) return num;
+  }
+
+  match = text.match(/\b([A-Z]{3})\s?(\d[\d.,\s]*\d|\d)\b/);
+  if (match && KNOWN_CURRENCY_CODES.has(match[1])) {
+    const num = parsePriceAmount(match[2]);
+    if (num != null) return num;
+  }
+
+  match = text.match(/\b(\d[\d.,\s]*\d|\d)\s?([A-Z]{3})\b/);
+  if (match && KNOWN_CURRENCY_CODES.has(match[2])) {
+    const num = parsePriceAmount(match[1]);
+    if (num != null) return num;
+  }
+
+  return null;
+}
+
+// A flat tolerance implicitly assumes a 2-decimal currency. That's far
+// too loose for 3-decimal currencies (KWD/BHD/OMR/JOD/TND) — 19 fils
+// difference on a KWD price is a real, economically meaningful gap, not
+// rounding noise — and not quite right for 0-decimal currencies like JPY
+// either, where there's no fractional unit at all. Returns a tolerance
+// scaled to the currency's actual minor unit.
+const THREE_DECIMAL_CURRENCIES = new Set(["KWD", "BHD", "OMR", "JOD", "TND"]);
+const ZERO_DECIMAL_CURRENCIES = new Set(["JPY", "KRW"]);
+
+function toleranceForCurrency(currency) {
+  if (currency && THREE_DECIMAL_CURRENCIES.has(currency)) return 0.002;
+  if (currency && ZERO_DECIMAL_CURRENCIES.has(currency)) return 1;
+  return 0.02;
 }
 
 // ---------- Currency handling ----------
