@@ -13,6 +13,13 @@ claim-confidence constant) used by `content.js`, `popup.js`, and
 `history.js` — loaded before each of them so there's one definition
 instead of three copies quietly drifting apart.
 
+`ledger.js` is the extension's **single writer**. Only the background
+service worker loads it, and every write to the ledger — price history,
+product metadata, comparison groups, and storage migrations — goes
+through its one serialized queue. Content scripts and the history page
+send a message and the worker applies the change; nothing else writes
+ledger storage directly (a test enforces this).
+
 1. **Detection** (`content.js`) — on every page load, it looks for
    `schema.org/Product` JSON-LD first (what most modern storefronts embed
    for SEO), then falls back to Open Graph / `itemprop="price"` meta tags.
@@ -126,17 +133,6 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
   cosmetic quirk, not a data problem. If linked retailers turn out to use
   different currencies, ranking and the overlay chart are disabled with an
   explanation rather than pretending the numbers are comparable.
-- **Cross-tab write races are only partially mitigated.** `recordObservation`
-  is a read-modify-write against `chrome.storage.local`; this content
-  script serializes its own concurrent calls (it deliberately runs a
-  `MutationObserver` and a poll simultaneously, which could otherwise race
-  against itself), but two separate *browser tabs* observing the same
-  product at the same moment could still each read stale history and one
-  write could clobber the other's. Properly closing that gap means
-  centralizing ledger writes in the background service worker instead of
-  each content script writing directly — a bigger architectural change
-  than this pass covers, and a low-probability scenario for personal use,
-  but a real one worth fixing before this handles anything higher-stakes.
 - **Chrome Web Store packaging isn't done.** The zip here is structured
   for `chrome://extensions` → Load Unpacked (folder-based), not Store
   submission — a real submission needs `manifest.json` at the zip root
@@ -182,9 +178,9 @@ before fixing (not just taken on faith) and confirmed fixed after:
   an exact price outranks a range floor, and a name matching the page
   outranks one that doesn't.
 
-Not everything was fully closed — see the cross-tab write race and Store
-packaging notes above for what's accepted as a known gap rather than
-fixed, and why.
+Not everything was fully closed at the time — the cross-tab write race
+was accepted as a known gap until 0.10.0 (see "Centralised ledger writes"
+below), and Store packaging still is.
 
 ### Second hardening pass
 
@@ -680,3 +676,71 @@ rather than jsdom. All reproduced before fixing.
   caller falls back correctly; long IDs get a hash suffix rather than a
   naive truncation).
 - **The test suite grew to 113 checks.**
+
+### Centralised ledger writes (0.10.0)
+
+The cross-tab write race — listed as a known gap since the first
+hardening pass — is closed, along with two update-time races found while
+investigating it. All three were reproduced against 0.9.7 with the real
+`content.js` and `background.js` running against a shared async storage
+fake before anything was changed.
+
+- **Two tabs could lose each other's observations.** Each tab's content
+  script did its own read-modify-write on the product's history; the
+  in-page lock couldn't reach across tabs. Reproduced: two tabs seeing
+  the same product at $110 and $100 left `[120, 100]` in storage — the
+  $110 reading was gone, and the $100 new-low alert reported the stale
+  $120 as the previous low. Content scripts now send observations to the
+  service worker (`PRICE_LEDGER_RECORD`), which applies them through the
+  single queue in `ledger.js`. There's deliberately no direct-write
+  fallback, since that would reintroduce the race.
+- **The two update migrations ran concurrently and clobbered each
+  other.** `onInstalled` fired the currency-sanitizing migration and the
+  identity-key migration without awaiting either, both working from their
+  own snapshot. Reproduced: a legacy entry with a poisoned currency was
+  moved to its new key *unsanitized*, and the sanitized copy was written
+  to the old key and then deleted. (`fmt()` validates currency itself
+  since the second pass, so this wasn't exploitable — but the migration
+  silently didn't do its job.) They now run strictly in sequence,
+  sanitize-then-move, each re-reading storage.
+- **A content script could write mid-migration and split a product's
+  history.** A post-update tab computing the new identity key could record
+  to it while the migration was still reading a large store; the
+  migration's don't-clobber guard then left the old history orphaned as a
+  second, separate entry. Reproduced with an 800ms full-store read:
+  `name:widget → [50, 45]` and `name:widget-p-widget-… → [40]`. Migrations
+  are now the first thing enqueued when the worker starts, so every write
+  is ordered after them. They're also checked on every worker start
+  against a per-version flag (`ledgerMigratedVersion`) rather than only in
+  `onInstalled`, so a missed or interrupted install event can't leave
+  storage half-migrated; the flag is set only after both succeed.
+- **The worker validates what it writes.** The domain and page URL come
+  from the message sender's own frame URL, not the message, so a content
+  script can only write under the site it's actually running on. Price
+  and claimed price must be finite and non-negative, currency is
+  re-sanitized, product keys must be well-formed and bounded, and only
+  `title`/`url`/`lastSeen` are ever persisted as metadata. Recording is
+  accepted only from tabs on http/https pages.
+- **Comparison groups go through the same queue** (`PRICE_LEDGER_GROUPS`),
+  and only the extension's own pages may create or delete them — two
+  history tabs open at once could previously overwrite each other's
+  changes to the groups list.
+- **A failed record no longer throws into the page's console.** If the
+  worker can't record an observation (for instance, a tab whose content
+  script was orphaned by an extension update), the badge simply isn't
+  shown, rather than rendering from history the tab can't vouch for.
+- **The test suite grew to 120 checks**, including async behavioural
+  tests that run the real service worker and real content scripts in
+  jsdom tabs against a shared storage fake with realistic latency.
+  Revert-proven: restoring the 0.9.7 `content.js`, `background.js`, or
+  `history.js` each fails the relevant tests, as do targeted mutations
+  that bypass the queue or run the migrations concurrently. The old
+  source-pattern check that `content.js` doesn't persist `image` was
+  replaced with a behavioural one against the actual writer.
+
+Still open, noted rather than fixed in this pass: histories that 0.9.7
+already split during an update (the third bullet) are left as two entries
+rather than merged; and the toolbar alert counter's clear-on-popup-open
+isn't routed through the same queue as its increment, which looks like it
+could drop a count if the two coincide — spotted by inspection, not yet
+reproduced.

@@ -40,21 +40,22 @@ async function loadGroups() {
   return groups || [];
 }
 
-async function saveGroups(groups) {
-  await chrome.storage.local.set({ groups });
+// Writes go through the background service worker's single ledger queue
+// (ledger.js), same as price observations — two history tabs open at once
+// could otherwise read-modify-write the groups list over each other.
+async function groupsRequest(message) {
+  const response = await chrome.runtime.sendMessage({ type: "PRICE_LEDGER_GROUPS", ...message });
+  if (!response?.ok) throw new Error(`Price Ledger: comparison not saved (${response?.error || "no response"})`);
+  return response;
 }
 
 async function createGroup(name, memberKeys) {
-  const groups = await loadGroups();
-  const id = `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  groups.push({ id, name, members: memberKeys });
-  await saveGroups(groups);
+  const { id } = await groupsRequest({ op: "create", name, members: memberKeys });
   return id;
 }
 
 async function deleteGroup(id) {
-  const groups = await loadGroups();
-  await saveGroups(groups.filter((g) => g.id !== id));
+  await groupsRequest({ op: "delete", id });
 }
 
 function renderSidebar(state) {
@@ -882,7 +883,7 @@ async function main() {
         onCreateGroup: async () => {
           if (selectedKeys.size < 2) return;
           const name = window.prompt("Name this product (shown across all linked retailers):", "");
-          if (!name) return;
+          if (!name || !name.trim()) return;
           await createGroup(name.trim(), Array.from(selectedKeys));
           groups = await loadGroups();
           selectionMode = false;

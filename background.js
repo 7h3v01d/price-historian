@@ -1,10 +1,13 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Leon Priest (GitHub: 7h3v01d)
+//
 // Price Ledger — background service worker
 // Content scripts can't call chrome.notifications directly (that API is
 // only available in extension contexts), so they message this worker
 // whenever they record a genuine new low, and this handles the OS
 // notification plus a small "unseen alerts" badge on the toolbar icon.
 
-importScripts("shared.js"); // brings in fmt()
+importScripts("shared.js", "ledger.js"); // fmt(), sanitizeCurrency(), createLedger(), ...
 
 // MV3 service workers can be terminated after ~30s of inactivity and
 // respawned fresh on the next event — any plain in-memory object here
@@ -94,105 +97,56 @@ chrome.runtime.onMessage.addListener((message) => {
   chrome.action.setBadgeText({ text: "" });
 });
 
-// ---------- Legacy storage migration ----------
-// sanitizeCurrency() closes the injection path for every observation
-// recorded from this version onward. But chrome.storage.local survives
-// ordinary extension updates (it's only cleared if the extension is
-// removed entirely), so any currency value already persisted by an older
-// version — before this validation existed — would otherwise sit in
-// storage indefinitely, still reachable by fmt() on every future render.
-// This walks existing history entries once per update and sanitizes any
-// currency value that doesn't pass validation, rather than leaving
-// pre-existing data as the one path that's still unguarded.
-async function migrateLegacyCurrencyData() {
-  const all = await chrome.storage.local.get(null);
-  const updates = {};
-  let changedCount = 0;
+// ---------- Ledger writes and migrations ----------
+// All ledger storage writes (history, product metadata, comparison groups)
+// and the storage migrations go through one serialized queue here — see
+// ledger.js for why. The migration check is enqueued first, synchronously
+// at worker start, so every write this worker ever handles is ordered
+// after it. It runs on every start rather than only in onInstalled; the
+// per-version flag makes that a single small read once migrated.
+const ledger = createLedger(chrome.storage.local);
 
-  for (const key of Object.keys(all)) {
-    if (!key.startsWith("history:")) continue;
-    const entries = all[key];
-    if (!Array.isArray(entries)) continue;
-
-    let changed = false;
-    const cleaned = entries.map((entry) => {
-      if (sanitizeCurrency(entry.c, null) === entry.c) return entry;
-      changed = true;
-      // Domain isn't reliably recoverable from the storage key alone in
-      // every case, so fall back to a plain "unknown" marker rather than
-      // guessing — fmt() already renders that honestly.
-      return { ...entry, c: sanitizeCurrency(entry.c, null) };
-    });
-
-    if (changed) {
-      updates[key] = cleaned;
-      changedCount++;
-    }
-  }
-
-  if (changedCount > 0) {
-    await chrome.storage.local.set(updates);
-  }
-}
-
-chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason === "update") {
-    migrateLegacyCurrencyData();
-    migrateNameBasedIdentityKeys();
-  }
+ledger.ensureMigrated(chrome.runtime.getManifest().version).catch((err) => {
+  // Don't wedge writes on a failed migration; the flag isn't set, so it
+  // retries on the next worker start.
+  console.error("Price Ledger: storage migration failed", err);
 });
 
-// normalize() was changed to always incorporate a hash of the full
-// Unicode title (not just whatever ASCII survived stripping), and the
-// fallback product key now also incorporates the page's URL path, not
-// just the title — a generic reused title ("Product Details") on two
-// different product pages used to share one identity. Both changes mean
-// every existing name-based storage key computes to a different key than
-// before. Without migrating, every previously tracked name-based product
-// would silently lose its history on update, which is exactly the kind
-// of "just reset everything" failure this extension has otherwise been
-// careful to avoid. This recomputes each product's key from its own
-// stored title and URL and moves the data across, rather than leaving
-// old keys to rot unreferenced.
-async function migrateNameBasedIdentityKeys() {
-  const all = await chrome.storage.local.get(null);
-  const updates = {};
-  const removals = [];
-
-  for (const key of Object.keys(all)) {
-    const match = key.match(/^meta:([^:]+):name:(.+)$/);
-    if (!match) continue;
-    const [, domain, oldSlug] = match;
-    const meta = all[key];
-    if (!meta || typeof meta.title !== "string") continue;
-
-    let pathname = "";
-    try {
-      pathname = meta.url ? new URL(meta.url).pathname : "";
-    } catch {
-      // malformed/missing URL — fall back to title-only identity, same
-      // as buildFallbackProductKey does with an empty pathname
-    }
-
-    const newProductKey = buildFallbackProductKey(meta.title, pathname);
-    const oldProductKey = `name:${oldSlug}`;
-    if (newProductKey === oldProductKey) continue; // already current, or coincidentally unchanged
-
-    const newMetaKey = `meta:${domain}:${newProductKey}`;
-    if (all[newMetaKey] || updates[newMetaKey]) continue; // don't clobber existing data at the destination — leave this one alone rather than risk losing something
-
-    const oldHistoryKey = `history:${domain}:${oldProductKey}`;
-    const newHistoryKey = `history:${domain}:${newProductKey}`;
-
-    updates[newMetaKey] = meta;
-    if (all[oldHistoryKey]) updates[newHistoryKey] = all[oldHistoryKey];
-    removals.push(key, oldHistoryKey);
-  }
-
-  if (Object.keys(updates).length > 0) {
-    await chrome.storage.local.set(updates);
-  }
-  if (removals.length > 0) {
-    await chrome.storage.local.remove(removals);
-  }
+function isExtensionPage(sender) {
+  return sender?.id === chrome.runtime.id && typeof sender.url === "string" &&
+    sender.url.startsWith(chrome.runtime.getURL(""));
 }
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "PRICE_LEDGER_RECORD") return;
+  // Only content scripts (which run in a tab on an http/https page) record
+  // observations, and the domain comes from the sender's own URL.
+  const obs = sender?.tab ? validateObservation(message.product, sender.url) : null;
+  if (!obs) {
+    sendResponse({ ok: false, error: "rejected observation" });
+    return;
+  }
+  ledger.record(obs).then(
+    (result) => sendResponse({ ok: true, ...result }),
+    (err) => sendResponse({ ok: false, error: String(err?.message || err) })
+  );
+  return true; // async sendResponse
+});
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type !== "PRICE_LEDGER_GROUPS") return;
+  // Comparisons are only ever edited from the extension's own history page.
+  if (!isExtensionPage(sender)) {
+    sendResponse({ ok: false, error: "not allowed" });
+    return;
+  }
+  const op =
+    message.op === "create" ? ledger.createGroup(message.name, message.members)
+    : message.op === "delete" ? ledger.deleteGroup(message.id)
+    : Promise.reject(new Error("unknown op"));
+  op.then(
+    (id) => sendResponse({ ok: true, id }),
+    (err) => sendResponse({ ok: false, error: String(err?.message || err) })
+  );
+  return true;
+});

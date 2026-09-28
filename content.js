@@ -468,9 +468,7 @@
       if (key === lastKey) return; // no meaningful change since last observation
       lastKey = key;
 
-      const { history, isNewLow, priorLow } = await recordObservation(product);
-      renderBadge(product, history);
-      if (isNewLow) notifyNewLow(product, priorLow);
+      await recordAndShow(product);
     };
 
     check();
@@ -511,110 +509,45 @@
   }
 
   // ---------- 2. Storage ----------
-
-  function historyKey(productKey) {
-    return `history:${DOMAIN}:${productKey}`;
-  }
-  function metaKey(productKey) {
-    return `meta:${DOMAIN}:${productKey}`;
-  }
-
-  async function loadHistory(productKey) {
-    const key = historyKey(productKey);
-    const result = await chrome.storage.local.get(key);
-    return result[key] || [];
-  }
-
-  // recordObservation() is a read-modify-write against chrome.storage.local:
-  // load history, mutate it, write the whole thing back. This content
-  // script deliberately runs both a MutationObserver AND a 1.2s poll at
-  // the same time (see startDomPriceWatcher) as two paths to catch the
-  // same price change, which means it can genuinely call this function
-  // twice in close succession for what's logically one observation. A
-  // simple promise-chain lock serializes those calls so the second one
-  // always sees the first one's write, rather than both reading the same
-  // stale history and one silently overwriting the other's result.
-  //
-  // This does NOT protect against a second browser TAB observing the same
-  // product concurrently — that would need writes centralized in the
-  // background service worker (each content script/tab has its own
-  // separate JS context, so an in-page lock like this one can't reach
-  // across tabs). That's accepted as a known gap for now: worth fixing
-  // properly if it ever turns out to matter in practice, but a bigger
-  // architectural change than this pass covers.
-  let recordQueue = Promise.resolve();
-
-  function recordObservation(product) {
-    const result = recordQueue.then(() => recordObservationUnsafe(product));
-    // Swallow rejections in the chain itself so one failed write doesn't
-    // permanently wedge every future call behind a rejected promise —
-    // each caller still sees its own real result or error via `result`.
-    recordQueue = result.catch(() => {});
-    return result;
-  }
-
-  async function recordObservationUnsafe(product) {
-    const key = historyKey(product.productKey);
-    const mKey = metaKey(product.productKey);
-    const history = await loadHistory(product.productKey);
-
-    // Snapshot the low BEFORE today's point is added, so "new low" means
-    // "lower than everything previously observed," not "lower than itself."
-    // Only compare within the same currency — a $65 USD reading isn't a
-    // "new low" against a $100 AUD history, those numbers aren't
-    // commensurable. A currency change effectively starts a fresh
-    // comparison baseline rather than corrupting the existing one.
-    const priorSameCurrency = filterSameCurrency(history, product.currency);
-    const priorPrices = priorSameCurrency.map((h) => h.p);
-    const priorLow = priorPrices.length ? Math.min(...priorPrices) : null;
-    const isNewLow = priorLow !== null && product.price < priorLow - 0.001;
-
-    const now = Date.now();
-    const last = history[history.length - 1];
-    const incomingClaim = product.claimedWasPrice ?? null;
-    // Avoid spamming duplicate points on the same day at the exact same
-    // reading — but a currency change OR a claim appearing/disappearing/
-    // changing is a real change even if the price itself matches. A claim
-    // is evidence in its own right (it's what the badge and history chart
-    // check against future visits), so silently dropping or preserving a
-    // stale one on the "no price change" fast path would let the ledger
-    // lie about what the retailer actually displayed at that moment.
-    const sameDay = last && new Date(last.t).toDateString() === new Date(now).toDateString();
-    const sameReading =
-      last && last.p === product.price && last.c === product.currency && (last.w ?? null) === incomingClaim;
-    if (!last || !sameReading || !sameDay) {
-      history.push({
-        p: product.price,
-        c: product.currency,
-        t: now,
-        // "w" = the retailer's own claimed was/RRP price at the time, if any.
-        // Kept per-datapoint so a claim can be checked against your actual
-        // observed history, not just today's number.
-        w: incomingClaim,
-      });
-    }
-    // Cap history length so storage doesn't grow unbounded.
-    const trimmed = history.slice(-200);
-
-    await chrome.storage.local.set({
-      [key]: trimmed,
-      [mKey]: {
+  // This content script never writes ledger storage itself. Each tab is its
+  // own JS context, so an in-page lock couldn't stop two tabs doing a
+  // read-modify-write on the same history at once (one tab's observation
+  // was silently lost — reproduced against 0.9.7). Observations go to the
+  // background service worker instead, which applies every ledger write
+  // through a single queue (ledger.js) and derives the domain from this
+  // tab's URL itself. There's deliberately no direct-write fallback: it
+  // would reintroduce exactly the race this closes.
+  async function recordObservation(product) {
+    const response = await chrome.runtime.sendMessage({
+      type: "PRICE_LEDGER_RECORD",
+      product: {
+        productKey: product.productKey,
         title: product.title,
-        // Deliberately not storing product.image: it's page-controlled
-        // (from JSON-LD or og:image), unbounded in length, and isn't
-        // displayed anywhere in the popup or history UI — pure
-        // unnecessary attack surface. A hostile page could otherwise
-        // supply an enormous string or a large data: URL, and since
-        // history and metadata are written in the same
-        // chrome.storage.local.set() call, an oversized metadata value
-        // could push the whole write over quota and block the actual
-        // observation from being recorded too.
-        url: location.href,
-        lastSeen: now,
+        price: product.price,
+        currency: product.currency,
+        claimedWasPrice: product.claimedWasPrice ?? null,
       },
     });
+    if (!response?.ok) {
+      throw new Error(`Price Ledger: observation not recorded (${response?.error || "no response"})`);
+    }
+    return { history: response.history, isNewLow: response.isNewLow, priorLow: response.priorLow };
+  }
 
-    return { history: trimmed, isNewLow, priorLow };
+  // Records, then renders the badge from the worker's authoritative
+  // history. If the worker couldn't record it (e.g. this tab's content
+  // script was orphaned by an extension update), show nothing rather than
+  // a badge built from history this tab can't vouch for.
+  async function recordAndShow(product) {
+    let result;
+    try {
+      result = await recordObservation(product);
+    } catch (err) {
+      console.warn(String(err?.message || err));
+      return;
+    }
+    renderBadge(product, result.history);
+    if (result.isNewLow) notifyNewLow(product, result.priorLow);
   }
 
   // Content scripts run per-page, so a single in-memory guard is enough to
@@ -925,9 +858,7 @@
     }
     if (product) {
       stopDomPriceWatcher();
-      const { history, isNewLow, priorLow } = await recordObservation(product);
-      renderBadge(product, history);
-      if (isNewLow) notifyNewLow(product, priorLow);
+      await recordAndShow(product);
       return;
     }
     startDomPriceWatcher();

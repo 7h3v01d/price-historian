@@ -713,5 +713,227 @@ test("every ALL_CAPS constant name the README mentions actually exists in shared
   }
 });
 
-console.log(`\n${passed} passed, ${failed} failed (total)`);
-if (failed > 0) process.exit(1);
+// ---------------------------------------------------------------------------
+// Centralised ledger writes (0.10.0)
+//
+// These are async and behavioural: they load the REAL background.js (with
+// ledger.js via importScripts) and the REAL content.js into sandboxes that
+// share one fake chrome.storage with realistic async latency, then check
+// what actually ends up stored. Each one reproduces a race confirmed
+// against 0.9.7 before the fix.
+// ---------------------------------------------------------------------------
+
+const vm = require("vm");
+const ROOT = path.join(__dirname, "..");
+const asyncTests = [];
+function testAsync(name, fn) {
+  asyncTests.push([name, fn]);
+}
+
+function makeExtensionHarness({ slowFullReadMs = 0 } = {}) {
+  const store = {};
+  const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
+  const tick = () => new Promise((r) => setTimeout(r, 5));
+  const area = () => ({
+    async get(keys) {
+      // A full-store read is the slow one on a large real store.
+      await (keys == null && slowFullReadMs ? new Promise((r) => setTimeout(r, slowFullReadMs)) : tick());
+      const out = {};
+      const ks = keys == null ? Object.keys(store) : Array.isArray(keys) ? keys : [keys];
+      for (const k of ks) if (k in store) out[k] = clone(store[k]);
+      return out;
+    },
+    async set(obj) { await tick(); for (const [k, v] of Object.entries(obj)) store[k] = clone(v); },
+    async remove(ks) { await tick(); for (const k of [].concat(ks)) delete store[k]; },
+  });
+  const local = area();
+  const session = { async get() { return {}; }, async set() {}, async remove() {} };
+  const L = { installed: [], message: [] };
+  const ev = (n) => ({ addListener: (f) => n && L[n].push(f) });
+  const EXT = "chrome-extension://testid/";
+  const sent = [];
+
+  // Emulates MV3 runtime messaging: listeners get (message, sender,
+  // sendResponse); returning true keeps the channel open for async replies.
+  function deliver(message, sender) {
+    sent.push(clone(message));
+    return new Promise((resolve) => {
+      let pending = false, done = false;
+      const respond = (r) => { if (!done) { done = true; resolve(clone(r)); } };
+      for (const f of L.message) if (f(clone(message), sender, respond) === true) pending = true;
+      if (!pending) respond(undefined);
+    });
+  }
+  const bgChrome = {
+    storage: { local, session },
+    runtime: {
+      id: "testid",
+      onMessage: ev("message"), onInstalled: ev("installed"), onStartup: ev(),
+      getManifest: () => JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8")),
+      getURL: (p) => EXT + p,
+    },
+    notifications: { onClicked: ev(), onClosed: ev(), create() {} },
+    action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    tabs: { create() {} },
+  };
+  const ctx = {
+    chrome: bgChrome, console, setTimeout, clearTimeout, URL,
+    importScripts: (...files) => files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx)),
+  };
+  vm.createContext(ctx);
+
+  return {
+    store, sent,
+    startWorker() {
+      vm.runInContext(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"), ctx);
+      L.installed.forEach((f) => f({ reason: "update" }));
+    },
+    openTab(url, html) {
+      const dom = new JSDOM(html, { url, runScripts: "outside-only", pretendToBeVisual: true });
+      const sender = { id: "testid", url, tab: { id: Math.random() } };
+      dom.window.chrome = {
+        storage: { local },
+        runtime: { sendMessage: (m, cb) => { const p = deliver(m, sender); if (cb) p.then(cb); return p; } },
+      };
+      dom.window.eval(sharedSrc);
+      dom.window.eval(fs.readFileSync(path.join(ROOT, "content.js"), "utf8"));
+      return dom;
+    },
+    sendAs(sender, message) { return deliver(message, sender); },
+    extPageSender: { id: "testid", url: EXT + "history.html" },
+  };
+}
+
+const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const jsonLdPage = (price) => `<!doctype html><html><head><title>Widget</title>
+<script type="application/ld+json">${JSON.stringify({ "@type": "Product", name: "Widget", sku: "SKU-1",
+  offers: { "@type": "Offer", price: String(price), priceCurrency: "AUD" } })}</script></head><body><h1>Widget</h1></body></html>`;
+
+testAsync("two tabs recording the same product at once keep BOTH observations (0.9.7 lost one)", async () => {
+  const h = makeExtensionHarness();
+  const KEY = "history:shop.example:id:SKU-1";
+  h.store[KEY] = [{ p: 120, c: "AUD", t: Date.now() - 86400000, w: null }];
+  h.store["meta:shop.example:id:SKU-1"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 1 };
+  h.startWorker();
+  const a = h.openTab("https://shop.example/p/widget", jsonLdPage(110));
+  const b = h.openTab("https://shop.example/p/widget", jsonLdPage(100));
+  await wait(1200);
+  a.window.close(); b.window.close();
+  const prices = (h.store[KEY] || []).map((x) => x.p);
+  assert(prices.includes(110) && prices.includes(100), `stored history was [${prices}] — an observation was lost`);
+  // Serialized, so the second write sees the first: its priorLow is the
+  // other tab's price, not the stale 120.
+  const lows = h.sent.filter((m) => m.type === "PRICE_LEDGER_NEW_LOW").map((m) => m.priorLow).sort();
+  assert.deepStrictEqual(lows, [110, 120], `new-low priorLows were [${lows}]`);
+});
+
+testAsync("migrations run in sequence: moved legacy data is also currency-sanitized (0.9.7 lost the sanitization)", async () => {
+  const h = makeExtensionHarness();
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 1 };
+  h.store["history:shop.example:name:widget"] = [{ p: 10, c: "<img src=x onerror=alert(1)>", t: 1, w: null }];
+  h.startWorker();
+  await wait(300);
+  const hist = Object.keys(h.store).filter((k) => k.startsWith("history:"));
+  assert.strictEqual(hist.length, 1, `expected one history key, got ${hist}`);
+  assert(!hist[0].endsWith(":name:widget"), "legacy key wasn't migrated");
+  assert.strictEqual(h.store[hist[0]][0].c, null, `currency after migration: ${JSON.stringify(h.store[hist[0]][0].c)}`);
+});
+
+testAsync("a content script recording mid-migration lands in the migrated history, not a split one (0.9.7 split it)", async () => {
+  const h = makeExtensionHarness({ slowFullReadMs: 800 });
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 1 };
+  h.store["history:shop.example:name:widget"] = [{ p: 50, c: "AUD", t: 1, w: null }, { p: 45, c: "AUD", t: 2, w: null }];
+  h.startWorker();
+  const tab = h.openTab("https://shop.example/p/widget", `<!doctype html><html><head><title>Widget</title>
+    <meta property="og:title" content="Widget"><meta property="og:type" content="product">
+    <meta property="product:price:amount" content="40"><meta property="product:price:currency" content="AUD">
+    </head><body><h1>Widget</h1></body></html>`);
+  await wait(2800);
+  tab.window.close();
+  const hist = Object.keys(h.store).filter((k) => k.startsWith("history:"));
+  assert.strictEqual(hist.length, 1, `history split across ${hist.join(", ")}`);
+  assert.deepStrictEqual(h.store[hist[0]].map((x) => x.p), [50, 45, 40]);
+  assert(h.store[hist[0].replace("history:", "meta:")], "migrated history has no meta entry");
+});
+
+testAsync("migrations run once per version, not on every worker start", async () => {
+  const h = makeExtensionHarness();
+  h.startWorker();
+  await wait(100);
+  const version = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf8")).version;
+  assert.strictEqual(h.store.ledgerMigratedVersion, version);
+});
+
+testAsync("the worker derives the domain from the sender, not the message, and rejects bad observations", async () => {
+  const h = makeExtensionHarness();
+  h.startWorker();
+  const sender = { id: "testid", url: "https://www.real-shop.example/p/1", tab: { id: 1 } };
+  const ok = await h.sendAs(sender, { type: "PRICE_LEDGER_RECORD",
+    product: { productKey: "id:X", title: "X", price: 9.5, currency: "<script>", claimedWasPrice: null, domain: "evil.example", image: "data:image/png;base64," + "A".repeat(5000) } });
+  assert(ok?.ok, `valid observation rejected: ${JSON.stringify(ok)}`);
+  assert(h.store["history:real-shop.example:id:X"], "not stored under the sender's own domain");
+  assert(!Object.keys(h.store).some((k) => k.includes("evil.example")), "message-supplied domain was trusted");
+  assert.strictEqual(h.store["history:real-shop.example:id:X"][0].c, null, "currency wasn't sanitized by the worker");
+  // Replaces the old content.js source check now that content.js no longer
+  // writes storage: the actual writer must persist only these meta fields.
+  assert.deepStrictEqual(Object.keys(h.store["meta:real-shop.example:id:X"]).sort(), ["lastSeen", "title", "url"],
+    "unexpected fields persisted in product meta (image must never be stored)");
+  for (const [label, s, product] of [
+    ["NaN price", sender, { productKey: "id:X", price: NaN }],
+    ["negative price", sender, { productKey: "id:X", price: -1 }],
+    ["bad product key", sender, { productKey: "../x", price: 1 }],
+    ["no tab (extension page)", h.extPageSender, { productKey: "id:X", price: 1 }],
+    ["non-http sender", { id: "testid", url: "file:///x", tab: { id: 2 } }, { productKey: "id:X", price: 1 }],
+  ]) {
+    const r = await h.sendAs(s, { type: "PRICE_LEDGER_RECORD", product });
+    assert(r && r.ok === false, `${label} was accepted`);
+  }
+});
+
+testAsync("concurrent comparison creates both survive, and only extension pages may edit comparisons", async () => {
+  const h = makeExtensionHarness();
+  h.startWorker();
+  const mk = (name) => h.sendAs(h.extPageSender, { type: "PRICE_LEDGER_GROUPS", op: "create", name, members: ["a:1", "b:2"] });
+  const [r1, r2] = await Promise.all([mk("Milk"), mk("Bread")]);
+  assert(r1.ok && r2.ok);
+  assert.deepStrictEqual(h.store.groups.map((g) => g.name).sort(), ["Bread", "Milk"]);
+  const fromPage = await h.sendAs({ id: "testid", url: "https://shop.example/", tab: { id: 1 } },
+    { type: "PRICE_LEDGER_GROUPS", op: "delete", id: r1.id });
+  assert.strictEqual(fromPage.ok, false, "a content script was allowed to delete a comparison");
+  assert.strictEqual(h.store.groups.length, 2);
+  const del = await h.sendAs(h.extPageSender, { type: "PRICE_LEDGER_GROUPS", op: "delete", id: r1.id });
+  assert(del.ok);
+  assert.deepStrictEqual(h.store.groups.map((g) => g.name), ["Bread"]);
+});
+
+console.log("\nSingle-writer rule — only the service worker writes ledger keys");
+test("content.js, history.js and popup.js never call chrome.storage.local.set/remove", () => {
+  for (const file of ["content.js", "history.js", "popup.js"]) {
+    const src = fs.readFileSync(path.join(ROOT, file), "utf8");
+    assert(!/chrome\.storage\.local\.(set|remove)\s*\(/.test(src), `${file} writes chrome.storage.local directly`);
+  }
+});
+
+// A rejection escaping into a sandbox (e.g. an unhandled error in content.js)
+// is a test failure, not a crash of the whole suite.
+const strayRejections = [];
+process.on("unhandledRejection", (err) => strayRejections.push(err));
+
+(async () => {
+  console.log("\nCentralised ledger writes — real background.js + content.js, shared async storage");
+  for (const [name, fn] of asyncTests) {
+    try {
+      strayRejections.length = 0;
+      await fn();
+      if (strayRejections.length) throw new Error(`unhandled rejection: ${strayRejections[0]?.message || strayRejections[0]}`);
+      console.log(`  PASS  ${name}`);
+      passed++;
+    } catch (err) {
+      console.log(`  FAIL  ${name}`);
+      console.log(`        ${err.message}`);
+      failed++;
+    }
+  }
+  console.log(`\n${passed} passed, ${failed} failed (total)`);
+  process.exit(failed > 0 ? 1 : 0);
+})();
