@@ -47,7 +47,7 @@ function bumpUnseenBadge() {
     await chrome.storage.local.set({ unseenAlertCount: next });
     chrome.action.setBadgeText({ text: String(next) });
     chrome.action.setBadgeBackgroundColor({ color: "#E8A33D" });
-  });
+  }).catch((err) => console.error("Price Ledger: badge update failed", err));
   return badgeQueue;
 }
 
@@ -91,10 +91,22 @@ chrome.notifications.onClosed.addListener((notificationId) => {
 });
 
 // Clear the badge whenever the popup is opened — that's the "seen it" signal.
-chrome.runtime.onMessage.addListener((message) => {
+// Queued on the same chain as bumpUnseenBadge(): unqueued, a clear landing
+// between an increment's read and its write was undone by that write
+// (reproduced: count 5 → alert → popup opened → stored 6, badge "6").
+// Only the extension's own pages can clear it.
+function clearUnseenBadge() {
+  badgeQueue = badgeQueue.then(async () => {
+    await chrome.storage.local.set({ unseenAlertCount: 0 });
+    chrome.action.setBadgeText({ text: "" });
+  }).catch((err) => console.error("Price Ledger: badge clear failed", err));
+  return badgeQueue;
+}
+
+chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== "PRICE_LEDGER_CLEAR_BADGE") return;
-  chrome.storage.local.set({ unseenAlertCount: 0 });
-  chrome.action.setBadgeText({ text: "" });
+  if (!isExtensionPage(sender)) return;
+  clearUnseenBadge();
 });
 
 // ---------- Ledger writes and migrations ----------

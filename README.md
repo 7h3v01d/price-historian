@@ -90,6 +90,17 @@ same steps, just under `opera://extensions` instead of `chrome://extensions`.
 
 ## Known limitations (this is an MVP, not the pitch-deck version)
 
+- **"Was" claims are only checked on pages detected by the DOM watcher,
+  not on JSON-LD pages.** JSON-LD is the primary detection path and what
+  most modern storefronts use, but its price comes from structured data,
+  not a visible element, so there's no anchor to scope a claim search to.
+  The third hardening pass deliberately chose "no claim" over a
+  page-wide guess. That was the right call on precision, but it means the
+  claim check silently doesn't run on most stores. Found by the
+  real-browser suite in 0.10.2 and documented here rather than changed
+  mid-pass, since it's a design decision (see the 0.10.2 notes for a
+  proposed fix).
+
 - **No cross-device sync** — `chrome.storage.local` is per-browser-profile.
   Swapping to `chrome.storage.sync` would add sync but with a much smaller
   quota; a real product needs its own backend for durable, shared history.
@@ -738,9 +749,124 @@ fake before anything was changed.
   source-pattern check that `content.js` doesn't persist `image` was
   replaced with a behavioural one against the actual writer.
 
-Still open, noted rather than fixed in this pass: histories that 0.9.7
-already split during an update (the third bullet) are left as two entries
-rather than merged; and the toolbar alert counter's clear-on-popup-open
-isn't routed through the same queue as its increment, which looks like it
-could drop a count if the two coincide — spotted by inspection, not yet
-reproduced.
+Both items left open by this pass were closed in 0.10.1, below.
+
+### 0.10.1 — follow-ups
+
+Closes the two items 0.10.0 left open, plus two older migration bugs
+found while working on them. All four were reproduced first, and every
+fix is revert-proven (restoring the 0.10.0 file, or mutating out just the
+fix, fails the matching test).
+
+- **Opening the popup could leave a stale alert count.** The popup's
+  "clear" wasn't queued with the increment's read-then-write, so an alert
+  arriving just before the popup opened undid the clear. Reproduced:
+  count 5, alert, popup opened, stored count `6`, toolbar badge `"6"`.
+  Clear now runs on the same queue. Also found by inspection and then
+  proven by test: a single failed badge write rejected the queue's promise
+  and silently skipped **every** later badge update for the life of the
+  worker. Both links now catch and log. Only the extension's own pages
+  can clear the badge.
+- **Histories 0.9.7 had already split are merged back together.** The
+  identity migration used to skip a product whose new key already
+  existed, leaving the old copy orphaned as a second product. It now
+  unions the two: time-ordered, exact duplicate readings dropped, capped
+  at 200. Both keys resolve from the same stored title and URL, so they
+  are the same product by construction.
+- **Comparisons lost members when a product's key migrated** (live since
+  0.9.7). Groups store members as `domain:productKey`, and the migration
+  never updated them, so the comparison showed "one or more may have been
+  removed" while the data sat under the new key. The migration now
+  renames members in the same write as the move. Comparisons that
+  **already** lost a member under 0.9.7/0.10.0 can't be repaired
+  automatically — the old key no longer exists to map from — so re-create
+  those.
+- **Long or whitespace-padded titles restarted their history on every
+  update** (live since 0.9.7). The content script hashed the raw title
+  into the key, but the stored title was trimmed and cut to 140
+  characters; the migration recomputed keys from the stored title, so it
+  moved these current entries to a key nothing writes to. The next visit
+  started an empty history: no "lowest seen," claims back to "can't
+  verify," no new-low alerts. Reproduced end-to-end with a real
+  content-script recording, a worker restart at a new version, and a
+  second visit. The worker now derives `name:` keys itself from exactly
+  the title and path it stores, so the migration's recomputation matches
+  by construction. Affected entries move once on update and then stay
+  put. ID-based (SKU/GTIN/MPN) keys are unaffected.
+- **The migration never deletes a key it just wrote**, even for
+  inconsistent legacy data where one entry's new key is another entry's
+  old key.
+- **The test suite grew to 130 checks.**
+
+
+### 0.10.2 — real-browser test suite
+
+The jsdom suite can't exercise layout or the real extension runtime, and
+several past fixes were "verified by reasoning" only for that reason.
+`test/browser-tests.js` loads the unpacked extension into Playwright's
+Chromium, serves fixture pages from a local HTTP server under real
+`*.test` domains, and checks what actually lands in
+`chrome.storage.local`, read straight from the service worker. Each test
+gets a fresh browser profile.
+
+    npm install                  # once; dev-only (jsdom + playwright)
+    npx playwright install chromium   # once, if you don't have its browser yet
+    npm run test:browser         # PL_HEADED=1 to watch; PL_ONLY="text" to filter
+
+**21 tests**, covering:
+
+- **End to end through the real service worker:** exact JSON-LD price and
+  currency, the startup migration flag, two concurrent tabs, and an
+  in-place SPA price change.
+- **Visibility claims** from the fourth and later passes: responsive
+  `display:none`, hidden ancestors, `visibility:hidden` slides, hidden
+  `itemprop`, and inherited CSS line-through.
+- **Structured-vs-visible disagreement.**
+- **JSON-LD corroboration:**
+  - a lone homepage `Product`,
+  - `og:type=product` alone,
+  - a stale `Product` with a visible price,
+  - a listing page.
+- **The badge's closed Shadow DOM**, as seen from the page's own main
+  world, including host neutrality across a good and an alert verdict.
+- **Hostile stored titles** rendering as text in the popup and history
+  page.
+
+Every detection test was mutation-checked: removing the rule it covers
+makes it fail. That surfaced three tests that passed vacuously, because a
+second safety layer also caught the bad data. Their fixtures were
+rebuilt to isolate one layer each:
+
+- the `og:type=product` AND-gate,
+- the listing-page identity floor,
+- hidden `itemprop`.
+
+The suite found two real bugs, both now fixed and revert-proven:
+
+- **A price under an `opacity:0` ancestor counted as visible.** Opacity
+  doesn't inherit through computed style, so `isVisible()` only ever saw
+  the element's own opacity. Reproduced: a faded-out $20 was recorded
+  over the visible $65. Now also checked with Chromium's native
+  `checkVisibility({ opacityProperty: true })`.
+- **Carousel slides moved off-screen were recorded.** The fourth pass's
+  "inactive carousel slide" handling only covered `visibility:hidden`
+  carousels. Most carousels instead slide inactive items out of an
+  `overflow:hidden` track, where they still have real client rects and
+  visible styles. Reproduced: the hidden slide's $120 was recorded over
+  the visible $300. The new `isClippedAway()` treats an element as hidden
+  when less than half of it survives its `overflow:hidden`/`clip`
+  ancestors. Scrollable containers deliberately don't count, and guard
+  tests confirm that below-the-fold and scrolled-away prices still
+  register. Claim detection uses the same `isVisible()`, so it benefits
+  too.
+
+It also found one harness-only race, not a product bug: Playwright can
+attach to the service worker before Chromium installs its `chrome.*`
+bindings. `launch()` now waits for them.
+
+And it found the JSON-LD claim gap listed under Known limitations. A
+proposed fix: the structured-vs-visible check already locates the
+page's featured visible price and confirms it matches the JSON-LD price
+within tolerance. When it does, that element is a corroborated anchor,
+and claim scoping could use it. That would keep the precision the third
+pass wanted while turning the claim check on for most stores.

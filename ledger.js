@@ -59,15 +59,51 @@ function validateObservation(product, senderUrl) {
   const claimed = product.claimedWasPrice;
   const claimedWasPrice = typeof claimed === "number" && Number.isFinite(claimed) && claimed >= 0 ? claimed : null;
 
+  const cleanTitle = (typeof title === "string" ? title : "").trim().slice(0, LEDGER_TITLE_MAX);
+
+  // Name-based identity is derived HERE, from exactly the title and URL
+  // path that get stored as this product's meta — never taken from the
+  // message. The identity migration recomputes keys from stored meta, so
+  // the two must agree by construction. Before 0.10.1 the content script
+  // hashed the raw title while the stored title was trimmed and cut to 140
+  // characters: any long or whitespace-padded title had its current entry
+  // moved to a key nothing writes to on every update, restarting its
+  // history (live since 0.9.7). ID-based keys are unaffected.
+  const resolvedKey = productKey.startsWith("name:") ? buildFallbackProductKey(cleanTitle, url.pathname) : productKey;
+
   return {
     domain,
     url: url.href,
-    productKey,
+    productKey: resolvedKey,
     price,
     currency: sanitizeCurrency(product.currency, null),
     claimedWasPrice,
-    title: (typeof title === "string" ? title : "").trim().slice(0, LEDGER_TITLE_MAX),
+    title: cleanTitle,
   };
+}
+
+// Union of two histories for the same product: time-ordered, exact
+// duplicate readings dropped, capped like any other history. Never
+// invents or alters a reading.
+function mergeHistories(a, b) {
+  const seen = new Set();
+  const merged = [];
+  for (const h of [...a, ...b]) {
+    if (!h || typeof h !== "object" || !Number.isFinite(h.t)) continue;
+    const id = JSON.stringify([h.t, h.p, h.c ?? null, h.w ?? null]);
+    if (seen.has(id)) continue;
+    seen.add(id);
+    merged.push(h);
+  }
+  merged.sort((x, y) => x.t - y.t);
+  return merged.slice(-LEDGER_HISTORY_CAP);
+}
+
+// The most recently seen entry's title/URL win; lastSeen is the later one.
+function mergeMeta(dest, incoming) {
+  if (!dest || typeof dest !== "object") return incoming;
+  const newer = (incoming.lastSeen || 0) > (dest.lastSeen || 0) ? incoming : dest;
+  return { title: newer.title, url: newer.url, lastSeen: Math.max(dest.lastSeen || 0, incoming.lastSeen || 0) };
 }
 
 function createLedger(storage, options = {}) {
@@ -181,6 +217,7 @@ function createLedger(storage, options = {}) {
     const all = await storage.get(null);
     const updates = {};
     const removals = [];
+    const renamed = new Map(); // "domain:oldProductKey" -> "domain:newProductKey"
 
     for (const key of Object.keys(all)) {
       const match = key.match(/^meta:([^:]+):name:(.+)$/);
@@ -201,20 +238,45 @@ function createLedger(storage, options = {}) {
       if (newProductKey === oldProductKey) continue;
 
       const newMetaKey = `meta:${domain}:${newProductKey}`;
-      // Never clobber existing data at the destination. With writes now
-      // queued behind migrations, a destination can only already exist if
-      // it was created by a previous version — leave both alone.
-      if (all[newMetaKey] || updates[newMetaKey]) continue;
-
       const oldHistoryKey = `history:${domain}:${oldProductKey}`;
       const newHistoryKey = `history:${domain}:${newProductKey}`;
-      updates[newMetaKey] = meta;
-      if (all[oldHistoryKey]) updates[newHistoryKey] = all[oldHistoryKey];
+      const current = (k) => (k in updates ? updates[k] : all[k]);
+      const oldHistory = all[oldHistoryKey];
+      const destHistory = current(newHistoryKey);
+      if (oldHistory !== undefined && !Array.isArray(oldHistory)) continue; // unrecognised shape — leave it alone
+      if (destHistory !== undefined && !Array.isArray(destHistory)) continue;
+
+      // If the destination already exists — 0.9.7 could create it when a
+      // tab recorded mid-migration, leaving this old entry orphaned as a
+      // second copy of the same product — merge rather than skip. Both keys
+      // resolve from the same stored title and URL, so they're the same
+      // product by construction; the merge only ever unions observations.
+      if (oldHistory || destHistory) updates[newHistoryKey] = mergeHistories(destHistory || [], oldHistory || []);
+      updates[newMetaKey] = mergeMeta(current(newMetaKey), meta);
       removals.push(key, oldHistoryKey);
+      renamed.set(`${domain}:${oldProductKey}`, `${domain}:${newProductKey}`);
+    }
+
+    // Comparison groups store members as "domain:productKey", so a moved
+    // product has to be renamed in them too — otherwise the comparison
+    // silently loses that member (live since the 0.9.7 identity migration).
+    // Written in the same set() as the move, so they can't disagree.
+    if (renamed.size > 0 && Array.isArray(all.groups)) {
+      let changed = false;
+      const groups = all.groups.map((g) => {
+        if (!g || !Array.isArray(g.members)) return g;
+        const members = [...new Set(g.members.map((m) => renamed.get(m) || m))];
+        if (members.length === g.members.length && members.every((m, i) => m === g.members[i])) return g;
+        changed = true;
+        return { ...g, members };
+      });
+      if (changed) updates.groups = groups;
     }
 
     if (Object.keys(updates).length > 0) await storage.set(updates);
-    if (removals.length > 0) await storage.remove(removals);
+    // Never remove a key this same pass just wrote.
+    const toRemove = removals.filter((k) => !(k in updates));
+    if (toRemove.length > 0) await storage.remove(toRemove);
   }
 
   // Runs the migrations once per extension version. Checked on every worker

@@ -302,7 +302,52 @@
   function isVisible(el) {
     const style = getComputedStyle(el);
     if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    return el.getClientRects().length > 0;
+    if (el.getClientRects().length === 0) return false;
+    // opacity doesn't inherit through computed style, so an element inside
+    // a fully transparent ancestor (a faded-out variant panel) reports its
+    // own opacity as 1. checkVisibility() walks ancestors natively.
+    // Found by the real-browser suite: a $20 price under opacity:0 was
+    // recorded over the visible $65.
+    if (typeof el.checkVisibility === "function" && !el.checkVisibility({ opacityProperty: true, visibilityProperty: true })) {
+      return false;
+    }
+    return !isClippedAway(el);
+  }
+
+  // An element can have real client rects and fully visible styles while
+  // being clipped out of view by an overflow:hidden/clip ancestor — the
+  // usual way carousels hide inactive slides (translated off to the side
+  // of a clipping track), and how collapsed height:0 panels hide content.
+  // Treated as hidden when less than half of it survives every clipping
+  // ancestor: a real featured price is never mostly clipped, while a
+  // peeking next slide is. Scrollable (auto/scroll) containers don't
+  // count — their content is reachable by scrolling. Found by the
+  // real-browser suite: an off-screen slide's $120 was recorded over the
+  // visible slide's $300.
+  function isClippedAway(el) {
+    const rect = el.getBoundingClientRect();
+    const area = rect.width * rect.height;
+    if (area <= 0) return false; // nothing to measure; the rects check above already ran
+    let visible = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+    for (let node = el.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+      const cs = getComputedStyle(node);
+      const clipsX = cs.overflowX === "hidden" || cs.overflowX === "clip";
+      const clipsY = cs.overflowY === "hidden" || cs.overflowY === "clip";
+      if (!clipsX && !clipsY) continue;
+      const box = node.getBoundingClientRect();
+      if (clipsX) {
+        visible.left = Math.max(visible.left, box.left);
+        visible.right = Math.min(visible.right, box.right);
+      }
+      if (clipsY) {
+        visible.top = Math.max(visible.top, box.top);
+        visible.bottom = Math.min(visible.bottom, box.bottom);
+      }
+      const w = Math.max(0, visible.right - visible.left);
+      const h = Math.max(0, visible.bottom - visible.top);
+      if (w * h < area * 0.5) return true;
+    }
+    return false;
   }
 
   // isStruckThrough() comes from shared.js.

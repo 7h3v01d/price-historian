@@ -254,7 +254,10 @@ console.log("\nStructural checks — content.js safety patterns still bound to i
 // exercised with real behavioral tests instead of these (see above) — but
 // a few things still need live DOM/browser globals content.js owns
 // (findClaimedWasPrice's anchor requirement, the Shadow DOM badge
-// rendering) and remain checked this weaker way for now.
+// rendering) and remain checked this weaker way here. Since 0.10.2 the
+// real-browser suite (test/browser-tests.js) also checks the badge
+// isolation, visibility rules, and JSON-LD corroboration behaviourally in
+// Chromium; these source checks stay as a fast first line.
 const contentSrc = fs.readFileSync(path.join(__dirname, "..", "content.js"), "utf8");
 
 test("findClaimedWasPrice requires an anchor element (no whole-document fallback)", () => {
@@ -730,8 +733,7 @@ function testAsync(name, fn) {
   asyncTests.push([name, fn]);
 }
 
-function makeExtensionHarness({ slowFullReadMs = 0 } = {}) {
-  const store = {};
+function makeExtensionHarness({ slowFullReadMs = 0, store = {} } = {}) {
   const clone = (v) => (v === undefined ? v : JSON.parse(JSON.stringify(v)));
   const tick = () => new Promise((r) => setTimeout(r, 5));
   const area = () => ({
@@ -743,9 +745,15 @@ function makeExtensionHarness({ slowFullReadMs = 0 } = {}) {
       for (const k of ks) if (k in store) out[k] = clone(store[k]);
       return out;
     },
-    async set(obj) { await tick(); for (const [k, v] of Object.entries(obj)) store[k] = clone(v); },
+    async set(obj) {
+      await tick();
+      if (failSets > 0) { failSets--; throw new Error("injected storage failure"); }
+      for (const [k, v] of Object.entries(obj)) store[k] = clone(v);
+    },
     async remove(ks) { await tick(); for (const k of [].concat(ks)) delete store[k]; },
   });
+  let failSets = 0;
+  const badge = { text: "" };
   const local = area();
   const session = { async get() { return {}; }, async set() {}, async remove() {} };
   const L = { installed: [], message: [] };
@@ -773,17 +781,19 @@ function makeExtensionHarness({ slowFullReadMs = 0 } = {}) {
       getURL: (p) => EXT + p,
     },
     notifications: { onClicked: ev(), onClosed: ev(), create() {} },
-    action: { setBadgeText() {}, setBadgeBackgroundColor() {} },
+    action: { setBadgeText: ({ text }) => { badge.text = text; }, setBadgeBackgroundColor() {} },
     tabs: { create() {} },
   };
   const ctx = {
-    chrome: bgChrome, console, setTimeout, clearTimeout, URL,
+    // Worker errors are expected in failure-injection tests; keep them out of the report.
+    chrome: bgChrome, console: { ...console, error() {} }, setTimeout, clearTimeout, URL,
     importScripts: (...files) => files.forEach((f) => vm.runInContext(fs.readFileSync(path.join(ROOT, f), "utf8"), ctx)),
   };
   vm.createContext(ctx);
 
   return {
-    store, sent,
+    store, sent, badge,
+    failNextSet() { failSets = 1; },
     startWorker() {
       vm.runInContext(fs.readFileSync(path.join(ROOT, "background.js"), "utf8"), ctx);
       L.installed.forEach((f) => f({ reason: "update" }));
@@ -904,6 +914,157 @@ testAsync("concurrent comparison creates both survive, and only extension pages 
   const del = await h.sendAs(h.extPageSender, { type: "PRICE_LEDGER_GROUPS", op: "delete", id: r1.id });
   assert(del.ok);
   assert.deepStrictEqual(h.store.groups.map((g) => g.name), ["Bread"]);
+});
+
+const newLowMsg = { type: "PRICE_LEDGER_NEW_LOW", title: "W", price: 1, currency: "AUD", priorLow: 2, url: "https://shop.example/" };
+const tabSender = { id: "testid", url: "https://shop.example/", tab: { id: 1 } };
+
+testAsync("opening the popup right after an alert clears the count (0.10.0 resurrected it: stored 6, badge '6')", async () => {
+  const h = makeExtensionHarness();
+  h.store.unseenAlertCount = 5;
+  h.startWorker();
+  h.sendAs(tabSender, newLowMsg);
+  await wait(2);
+  h.sendAs(h.extPageSender, { type: "PRICE_LEDGER_CLEAR_BADGE" });
+  await wait(150);
+  assert.strictEqual(h.store.unseenAlertCount, 0, `stored count ${h.store.unseenAlertCount}`);
+  assert.strictEqual(h.badge.text, "", `toolbar badge "${h.badge.text}"`);
+});
+
+testAsync("an alert arriving after the popup clears still counts as one unseen", async () => {
+  const h = makeExtensionHarness();
+  h.store.unseenAlertCount = 5;
+  h.startWorker();
+  h.sendAs(h.extPageSender, { type: "PRICE_LEDGER_CLEAR_BADGE" });
+  await wait(2);
+  h.sendAs(tabSender, newLowMsg);
+  await wait(150);
+  assert.strictEqual(h.store.unseenAlertCount, 1);
+  assert.strictEqual(h.badge.text, "1");
+});
+
+testAsync("one failed badge write doesn't wedge every later badge update", async () => {
+  const h = makeExtensionHarness();
+  h.startWorker();
+  await wait(100); // let the migration check finish so the injected failure hits the badge
+  h.failNextSet();
+  h.sendAs(tabSender, newLowMsg);
+  await wait(60);
+  h.sendAs(tabSender, newLowMsg);
+  await wait(60);
+  assert.strictEqual(h.store.unseenAlertCount, 1, `count ${h.store.unseenAlertCount} — later updates were skipped`);
+  assert.strictEqual(h.badge.text, "1");
+});
+
+testAsync("a content script can't clear the unseen-alert badge", async () => {
+  const h = makeExtensionHarness();
+  h.store.unseenAlertCount = 3;
+  h.startWorker();
+  h.sendAs(tabSender, { type: "PRICE_LEDGER_CLEAR_BADGE" });
+  await wait(100);
+  assert.strictEqual(h.store.unseenAlertCount, 3);
+});
+
+// Pure helpers from ledger.js, exercised directly.
+const ledgerSrc = fs.readFileSync(path.join(ROOT, "ledger.js"), "utf8");
+// eslint-disable-next-line no-eval
+eval(ledgerSrc.replace(/^const /gm, "var "));
+testAsync("mergeHistories: time-ordered union, exact duplicates dropped, junk skipped, capped", async () => {
+  const a = [{ p: 40, c: "AUD", t: 3, w: null }, { p: 50, c: "AUD", t: 1, w: null }];
+  const b = [{ p: 50, c: "AUD", t: 1, w: null }, { p: 45, c: "AUD", t: 2, w: 60 }, null, "x", { p: 1 }];
+  assert.deepStrictEqual(mergeHistories(a, b).map((h) => [h.t, h.p]), [[1, 50], [2, 45], [3, 40]]);
+  // Same time and price but a different claim is a different reading — kept.
+  assert.strictEqual(mergeHistories([{ p: 5, c: "AUD", t: 1, w: null }], [{ p: 5, c: "AUD", t: 1, w: 9 }]).length, 2);
+  const big = Array.from({ length: 150 }, (_, i) => ({ p: i, c: "AUD", t: i, w: null }));
+  const big2 = Array.from({ length: 150 }, (_, i) => ({ p: i, c: "AUD", t: 1000 + i, w: null }));
+  const m = mergeHistories(big, big2);
+  assert.strictEqual(m.length, LEDGER_HISTORY_CAP);
+  assert.strictEqual(m[m.length - 1].t, 1149, "cap must keep the most recent readings");
+});
+
+function splitStore(h, newKey) {
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 2 };
+  h.store["history:shop.example:name:widget"] = [{ p: 50, c: "AUD", t: 1, w: null }, { p: 45, c: "AUD", t: 2, w: null }];
+  h.store[`meta:shop.example:${newKey}`] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 3 };
+  h.store[`history:shop.example:${newKey}`] = [{ p: 40, c: "AUD", t: 3, w: null }];
+}
+const widgetKey = buildFallbackProductKey("Widget", "/p/widget");
+
+testAsync("a history 0.9.7 already split is merged back into one entry on update (0.10.0 left it split)", async () => {
+  const h = makeExtensionHarness();
+  splitStore(h, widgetKey);
+  h.store.ledgerMigratedVersion = "0.10.0"; // an existing 0.10.0 install updating
+  h.startWorker();
+  await wait(300);
+  const hist = Object.keys(h.store).filter((k) => k.startsWith("history:"));
+  assert.deepStrictEqual(hist, [`history:shop.example:${widgetKey}`], `history keys: ${hist}`);
+  assert.deepStrictEqual(h.store[hist[0]].map((x) => x.p), [50, 45, 40]);
+  assert(!h.store["meta:shop.example:name:widget"], "old meta entry left behind (shows as a duplicate product)");
+  assert.strictEqual(h.store[`meta:shop.example:${widgetKey}`].lastSeen, 3);
+});
+
+testAsync("moving a product's key renames it in comparison groups too (lost a member since 0.9.7)", async () => {
+  const h = makeExtensionHarness();
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 2 };
+  h.store["history:shop.example:name:widget"] = [{ p: 50, c: "AUD", t: 1, w: null }];
+  h.store.groups = [
+    { id: "g1", name: "Widget", members: ["shop.example:name:widget", "other.example:id:M1"] },
+    { id: "g2", name: "Untouched", members: ["a.example:id:1", "b.example:id:2"] },
+  ];
+  h.startWorker();
+  await wait(300);
+  assert.deepStrictEqual(h.store.groups[0].members, [`shop.example:${widgetKey}`, "other.example:id:M1"]);
+  assert.deepStrictEqual(h.store.groups[1].members, ["a.example:id:1", "b.example:id:2"]);
+});
+
+testAsync("a migrated product with no history on either side doesn't gain an empty history entry", async () => {
+  const h = makeExtensionHarness();
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 2 };
+  h.startWorker();
+  await wait(300);
+  assert(!Object.keys(h.store).some((k) => k.startsWith("history:")), "an empty history array was written");
+  assert(h.store[`meta:shop.example:${widgetKey}`], "meta wasn't moved");
+});
+
+testAsync("a long or padded no-SKU title keeps one stable history across an update (moved to an orphan key since 0.9.7)", async () => {
+  const name = "Samsung 65-inch QN90D Neo QLED 4K Smart TV with Quantum HDR, Dolby Atmos, Object Tracking Sound and Tizen OS, 2024 Model in Titan Black Finish";
+  const page = (price) => `<!doctype html><html><head><title>${name}</title>
+    <script type="application/ld+json">${JSON.stringify({ "@type": "Product", name: `  ${name}\n`,
+      offers: { "@type": "Offer", price: String(price), priceCurrency: "AUD" } })}</script></head><body><h1>${name}</h1></body></html>`;
+  const url = "https://shop.example/p/tv";
+  const h1 = makeExtensionHarness();
+  h1.startWorker();
+  const t1 = h1.openTab(url, page(100));
+  await wait(1200);
+  t1.window.close();
+  const before = Object.keys(h1.store).filter((k) => k.startsWith("history:"));
+  assert.strictEqual(before.length, 1, `first visit didn't record exactly one history: ${before}`);
+
+  // Extension updates: a fresh worker at a new version runs the migrations.
+  h1.store.ledgerMigratedVersion = "0.0.0";
+  const h2 = makeExtensionHarness({ store: h1.store });
+  h2.startWorker();
+  await wait(300);
+  const t2 = h2.openTab(url, page(90));
+  await wait(1200);
+  t2.window.close();
+  const after = Object.keys(h1.store).filter((k) => k.startsWith("history:"));
+  assert.strictEqual(after.length, 1, `history split after update: ${after.join(", ")}`);
+  assert.deepStrictEqual(h1.store[after[0]].map((x) => x.p), [100, 90]);
+});
+
+testAsync("the identity migration never deletes a key it just wrote (inconsistent legacy data loses no readings)", async () => {
+  const h = makeExtensionHarness();
+  // A moves to widgetKey; B already sits at widgetKey but its own meta
+  // recomputes elsewhere, so B's old key (== A's new key) is a removal.
+  h.store["meta:shop.example:name:widget"] = { title: "Widget", url: "https://shop.example/p/widget", lastSeen: 2 };
+  h.store["history:shop.example:name:widget"] = [{ p: 50, c: "AUD", t: 1, w: null }];
+  h.store[`meta:shop.example:${widgetKey}`] = { title: "Gadget", url: "https://shop.example/g", lastSeen: 1 };
+  h.store[`history:shop.example:${widgetKey}`] = [{ p: 7, c: "AUD", t: 1, w: null }];
+  h.startWorker();
+  await wait(300);
+  const readings = Object.keys(h.store).filter((k) => k.startsWith("history:")).flatMap((k) => h.store[k].map((x) => x.p));
+  assert(readings.includes(50) && readings.includes(7), `readings after migration: [${readings}]`);
 });
 
 console.log("\nSingle-writer rule — only the service worker writes ledger keys");
